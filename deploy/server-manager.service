@@ -1,22 +1,27 @@
 # Installed by scripts/deploy-to-server.sh to /etc/systemd/system/server-manager.service.
-# System unit (starts at boot) running as ubuntu; XDG_RUNTIME_DIR + DBUS let it drive the
-# per-app `systemctl --user` units (linger is on for ubuntu, rencana K2).
+# Runs as root (owner's decision 2026-10-18: full access to the server). Apps do NOT inherit
+# this: each app runs as its own `run_as` user (default ubuntu) via a system unit
+# /etc/systemd/system/app-<name>.service with User=, and builds run through `runuser`.
+# Root here means a dashboard login = root on the box: keep it on 127.0.0.1 (SSH tunnel).
 [Unit]
 Description=Server Manager (deploy, env, PostgreSQL, nginx, usage)
-After=network-online.target
+After=network-online.target postgresql.service nginx.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
+User=root
+Group=root
 WorkingDirectory=/home/ubuntu/server-manager
 ExecStart=/home/ubuntu/server-manager/bin/server-manager
 Environment=HOST=127.0.0.1
 Environment=PORT=3900
+Environment=HOME=/root
+Environment=SM_DATA_DIR=/home/ubuntu/.server-manager
+Environment=SM_APPS_DIR=/home/ubuntu/apps
 Environment=SM_WEB_DIST=/home/ubuntu/server-manager/web/dist
-Environment=XDG_RUNTIME_DIR=/run/user/1000
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=SM_DEFAULT_RUN_AS=ubuntu
+UMask=0077
 Restart=on-failure
 RestartSec=3
 
