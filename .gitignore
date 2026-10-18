@@ -1,0 +1,5 @@
+/target
+/web/node_modules
+/web/dist
+/web/dashboard/styles.css
+.DS_Store

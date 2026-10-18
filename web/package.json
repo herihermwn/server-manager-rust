@@ -1,0 +1,17 @@
+{
+  "name": "server-manager-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "./build.sh"
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "tailwindcss": "^3.4.19"
+  }
+}

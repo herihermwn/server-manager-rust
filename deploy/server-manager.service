@@ -1,0 +1,24 @@
+# Installed by scripts/deploy-to-server.sh to /etc/systemd/system/server-manager.service.
+# System unit (starts at boot) running as ubuntu; XDG_RUNTIME_DIR + DBUS let it drive the
+# per-app `systemctl --user` units (linger is on for ubuntu, rencana K2).
+[Unit]
+Description=Server Manager (deploy, env, PostgreSQL, nginx, usage)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/server-manager
+ExecStart=/home/ubuntu/server-manager/bin/server-manager
+Environment=HOST=127.0.0.1
+Environment=PORT=3900
+Environment=SM_WEB_DIST=/home/ubuntu/server-manager/web/dist
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
