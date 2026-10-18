@@ -62,6 +62,10 @@ pub struct Cmd {
     timeout: Duration,
     secrets: Vec<String>,
     cancel: Option<Arc<Notify>>,
+    /// Start from an empty environment instead of the manager's (minus SM_*).
+    clear_env: bool,
+    /// Shown by `display()` instead of the argv (e.g. when argv carries app env values).
+    label: Option<String>,
 }
 
 /// The system user an owner-written command runs as (apps.run_as), resolved from passwd.
@@ -81,37 +85,77 @@ impl RunAs {
     }
 }
 
-/// `nice -n 10 bash -lc <script>` for owner-written build/start commands (rencana §2, §6).
+/// Keys never passed to an owner command, even after the privilege drop: they change how
+/// programs load or how bash starts (LD_*/DYLD_*, GCONV_PATH, BASH_ENV, ENV, IFS, …). PATH is
+/// always the user's default, never taken from .env.
+pub fn forbidden_env_key(k: &str) -> bool {
+    k.starts_with("LD_")
+        || k.starts_with("DYLD_")
+        || matches!(
+            k,
+            "GCONV_PATH" | "BASH_ENV" | "ENV" | "IFS" | "PS4" | "SHELLOPTS" | "BASHOPTS" | "PROMPT_COMMAND" | "PATH"
+        )
+}
+
+/// Split app variables into (passed, skipped key names). Values with NUL can't be argv and are skipped.
+pub fn safe_app_env(vars: &[(String, String)]) -> (Vec<(String, String)>, Vec<String>) {
+    let (mut keep, mut skip) = (Vec::new(), Vec::new());
+    for (k, v) in vars {
+        if forbidden_env_key(k) || k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0') {
+            skip.push(k.clone());
+        } else {
+            keep.push((k.clone(), v.clone()));
+        }
+    }
+    (keep, skip)
+}
+
+/// `nice -n 10 bash -lc <script>` for owner-written build / before-restart commands (rencana §2, §6).
 /// `-l` loads the login profile so rustup/bun/node are on PATH.
 ///
-/// When the manager is root and `run_as` is given, the command first drops to that user with
-/// `setpriv --reuid --regid --init-groups` (+ HOME/USER/PATH of that user). setpriv execs in place,
-/// so the child stays in our process group and timeout/cancel still kill the whole build.
-/// (`runuser -u` would start a new session that `killpg` can't reach.)
-pub fn run_shell_user_command(script: &str, run_as: Option<&RunAs>) -> Cmd {
+/// With `run_as`, the command is `[setpriv --reuid --regid --init-groups --] /usr/bin/env -i
+/// KEY=VAL… HOME= USER= LOGNAME= PATH= nice -n 10 bash -lc <script>`:
+/// - the wrapper process starts from an EMPTY environment, so root never sees an app variable
+///   (LD_PRELOAD & co. in shared/.env can't run code before the privilege drop);
+/// - app variables are separate argv elements of `env -i`, applied after setpriv dropped to the
+///   user; forbidden keys (`forbidden_env_key`) are left out;
+/// - setpriv (only when the manager is root) execs in place, so the child stays in our process
+///   group and timeout/cancel still kill the whole build (`runuser -u` would start a new session).
+pub fn run_shell_user_command(script: &str, run_as: Option<&RunAs>, app_env: &[(String, String)]) -> Cmd {
     // SAFETY: geteuid has no preconditions.
-    let root = unsafe { libc::geteuid() } == 0;
-    match run_as {
-        Some(u) if root => Cmd::new("setpriv")
-            .args([
-                format!("--reuid={}", u.uid),
-                format!("--regid={}", u.gid),
-                "--init-groups".into(),
-                "--".into(),
-                "nice".into(),
-                "-n".into(),
-                "10".into(),
-                "bash".into(),
-                "-lc".into(),
-                script.into(),
-            ])
-            .env("HOME", &u.home)
-            .env("USER", &u.user)
-            .env("LOGNAME", &u.user)
-            .env("PATH", u.path()),
-        Some(u) => Cmd::new("nice").args(["-n", "10", "bash", "-lc", script]).env("PATH", u.path()),
-        None => Cmd::new("nice").args(["-n", "10", "bash", "-lc", script]),
+    shell_cmd(script, run_as, app_env, unsafe { libc::geteuid() } == 0)
+}
+
+fn shell_cmd(script: &str, run_as: Option<&RunAs>, app_env: &[(String, String)], root: bool) -> Cmd {
+    let Some(u) = run_as else {
+        return Cmd::new("nice").args(["-n", "10", "bash", "-lc", script]);
+    };
+    let (vars, _) = safe_app_env(app_env);
+    let mut argv: Vec<String> = Vec::new();
+    if root {
+        argv.extend([
+            format!("--reuid={}", u.uid),
+            format!("--regid={}", u.gid),
+            "--init-groups".into(),
+            "--".into(),
+        ]);
+        argv.push("/usr/bin/env".into());
     }
+    argv.push("-i".into());
+    argv.extend(vars.into_iter().map(|(k, v)| format!("{k}={v}")));
+    // After the app vars, so HOME/USER/PATH always describe the real user.
+    argv.extend([
+        format!("HOME={}", u.home),
+        format!("USER={}", u.user),
+        format!("LOGNAME={}", u.user),
+        format!("PATH={}", u.path()),
+    ]);
+    argv.extend(["nice", "-n", "10", "bash", "-lc", script].map(String::from));
+    let program = if root { "/usr/bin/setpriv" } else { "/usr/bin/env" };
+    let mut c = Cmd::new(program).args(argv);
+    c.clear_env = true;
+    c.label = Some(format!("({}) {}", u.user, script.replace('\n', "; ")));
+    c
 }
 
 impl Cmd {
@@ -125,6 +169,8 @@ impl Cmd {
             timeout: Duration::from_secs(60),
             secrets: Vec::new(),
             cancel: None,
+            clear_env: false,
+            label: None,
         }
     }
 
@@ -167,6 +213,9 @@ impl Cmd {
 
     /// Human-readable form for logs ("$ git fetch origin main"). Secrets are masked.
     pub fn display(&self) -> String {
+        if let Some(l) = &self.label {
+            return redact(l, &self.secrets);
+        }
         let s = std::iter::once(self.program.as_str())
             .chain(self.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
@@ -206,9 +255,13 @@ impl Cmd {
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true);
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("SM_") {
-                c.env_remove(k);
+        if self.clear_env {
+            c.env_clear();
+        } else {
+            for (k, _) in std::env::vars_os() {
+                if k.to_string_lossy().starts_with("SM_") {
+                    c.env_remove(k);
+                }
             }
         }
         c.envs(self.env.iter().map(|(k, v)| (k, v)));
@@ -345,7 +398,7 @@ mod tests {
     async fn manager_env_is_not_inherited() {
         // SAFETY: test-only; no other test reads this variable.
         unsafe { std::env::set_var("SM_TEST_SECRET", "x") };
-        let o = run_shell_user_command("echo \"[${SM_TEST_SECRET:-}]\"", None)
+        let o = run_shell_user_command("echo \"[${SM_TEST_SECRET:-}]\"", None, &[])
             .output()
             .await
             .unwrap();
@@ -356,7 +409,7 @@ mod tests {
     async fn timeout_kills_the_whole_group() {
         let start = std::time::Instant::now();
         // The background sleep keeps stdout open; only a group kill ends it.
-        let o = run_shell_user_command("sleep 30 & sleep 30", None)
+        let o = run_shell_user_command("sleep 30 & sleep 30", None, &[])
             .timeout(Duration::from_millis(300))
             .output()
             .await
@@ -382,6 +435,85 @@ mod tests {
         );
         n.notify_one();
         assert_eq!(run.await.unwrap().unwrap(), Exit::Cancelled);
+    }
+
+    fn app_env() -> Vec<(String, String)> {
+        [
+            ("SECRET_TOKEN", "abc123456"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("BASH_ENV", "/tmp/x"),
+            ("PATH", "/tmp/bin"),
+            ("FOO", "bar baz"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    fn me() -> RunAs {
+        // SAFETY: getuid/getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        RunAs {
+            user: "me".into(),
+            uid,
+            gid,
+            home: std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+        }
+    }
+
+    #[test]
+    fn root_side_env_holds_no_app_variable() {
+        let c = shell_cmd("echo hi", Some(&me()), &app_env(), true);
+        // The root-run wrapper starts empty and gets nothing set: app vars live only in env -i's argv.
+        assert!(c.clear_env);
+        assert!(c.env.is_empty(), "{:?}", c.env);
+        assert_eq!(c.program, "/usr/bin/setpriv");
+        let at = |s: &str| c.args.iter().position(|a| a == s).unwrap();
+        assert!(at("--init-groups") < at("/usr/bin/env") && at("/usr/bin/env") < at("-i"));
+        assert!(c.args.contains(&"SECRET_TOKEN=abc123456".to_string()) && c.args.contains(&"FOO=bar baz".to_string()));
+        assert!(
+            !c.args
+                .iter()
+                .any(|a| a.starts_with("LD_PRELOAD=") || a.starts_with("BASH_ENV=") || a == "PATH=/tmp/bin")
+        );
+        assert!(at("SECRET_TOKEN=abc123456") > at("-i") && at("SECRET_TOKEN=abc123456") < at("nice"));
+        assert!(
+            !c.display().contains("abc123456"),
+            "display shows the script, not the env argv"
+        );
+        let (_, skipped) = safe_app_env(&app_env());
+        assert_eq!(skipped, ["LD_PRELOAD", "BASH_ENV", "PATH"]);
+        for k in [
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "GCONV_PATH",
+            "IFS",
+            "PS4",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "PROMPT_COMMAND",
+            "ENV",
+        ] {
+            assert!(forbidden_env_key(k), "{k}");
+        }
+        assert!(!forbidden_env_key("DATABASE_URL") && !forbidden_env_key("ENVIRONMENT"));
+    }
+
+    #[tokio::test]
+    async fn app_env_reaches_child_without_dangerous_keys_or_parent_env() {
+        // SAFETY: test-only; no other test reads this variable.
+        unsafe { std::env::set_var("P3_PARENT_ONLY", "leak") };
+        let o = run_shell_user_command(
+            r#"echo "[$SECRET_TOKEN][$FOO][${LD_PRELOAD:-}][${BASH_ENV:-}][${P3_PARENT_ONLY:-}]"; echo "$PATH""#,
+            Some(&me()),
+            &app_env(),
+        )
+        .output()
+        .await
+        .unwrap();
+        let mut lines = o.stdout.lines();
+        assert_eq!(lines.next(), Some("[abc123456][bar baz][][][]"), "{}", o.stderr);
+        assert!(!o.stdout.contains("/tmp/bin"), "PATH from .env must not win");
     }
 
     #[test]

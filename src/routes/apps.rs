@@ -1106,8 +1106,34 @@ async fn create(
             .output()
             .await?;
         if o.exit.success() {
-            env = o.stdout;
             log.push("$ cp .env.example shared/.env".into());
+            // A repo can't smuggle LD_PRELOAD & co. into shared/.env (env.rs refuses them too).
+            let mut dropped = Vec::new();
+            env = o
+                .stdout
+                .lines()
+                .filter(|l| {
+                    let k = l
+                        .trim_start()
+                        .trim_start_matches("export ")
+                        .split('=')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    let bad = crate::exec::forbidden_env_key(k);
+                    if bad {
+                        dropped.push(k.to_owned());
+                    }
+                    !bad
+                })
+                .map(|l| format!("{l}\n"))
+                .collect();
+            if !dropped.is_empty() {
+                log.push(format!(
+                    "warning: left out of .env (not allowed): {}",
+                    dropped.join(", ")
+                ));
+            }
         }
     }
     if !env

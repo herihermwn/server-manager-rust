@@ -269,6 +269,22 @@ impl EnvFile {
     }
 }
 
+/// Keys an app may not set (exec::forbidden_env_key): they would let .env change how programs load
+/// or how bash runs the build. PATH comes from the app user's login instead.
+fn check_key_allowed(key: &str) -> Result<(), String> {
+    if !crate::exec::forbidden_env_key(key) {
+        return Ok(());
+    }
+    let why = if key.starts_with("LD_") || key.starts_with("DYLD_") || key == "GCONV_PATH" {
+        "it would change how programs load"
+    } else if key == "PATH" {
+        "PATH comes from the app user's login; extend it in the build or start command"
+    } else {
+        "it would change how the shell runs commands"
+    };
+    Err(format!("{key} is not allowed: {why}."))
+}
+
 fn check_value(key: &str, v: &str) -> Result<(), String> {
     if v.len() > MAX_VALUE {
         return Err(format!("{key}: value is longer than {} KB.", MAX_VALUE / 1024));
@@ -344,6 +360,7 @@ fn apply_put(orig: &mut EnvFile, vars: &[PutVar]) -> Result<Changes, String> {
     let mut seen: HashSet<&str> = HashSet::new();
     for v in vars {
         validate::env_key(&v.key).map_err(msg)?;
+        check_key_allowed(&v.key)?;
         if !seen.insert(&v.key) {
             return Err(dup_msg(&v.key));
         }
@@ -440,6 +457,9 @@ fn paste_errors(file: &EnvFile, incoming: &EnvFile, mut errs: Vec<ParseError>) -
     let mut earlier: Vec<&str> = existing.clone();
     for l in &incoming.lines {
         if let Line::Var { key, line, .. } = l {
+            if let Err(message) = check_key_allowed(key) {
+                errs.push(ParseError { line: *line, message });
+            }
             if !existing.contains(&key.as_str())
                 && let Some(o) = case_clash(earlier.iter().copied(), key)
             {
@@ -937,6 +957,7 @@ pub async fn upsert_vars(
     let t = target(st, app).await.map_err(msg)?;
     for (k, v) in vars {
         validate::env_key(k).map_err(msg)?;
+        check_key_allowed(k)?;
         check_value(k, v)?;
     }
     let _g = WRITE_LOCK.lock().await;
@@ -944,7 +965,9 @@ pub async fn upsert_vars(
     for (k, v) in vars {
         l.file.set(k, v);
     }
-    write_env(&t, &l.file.serialize()).await.map_err(|e| format!("io: {e}"))?;
+    write_env(&t, &l.file.serialize())
+        .await
+        .map_err(|e| format!("io: {e}"))?;
     for (k, _) in vars {
         save_meta(st, t.id, k, true, source)
             .await
@@ -1099,8 +1122,47 @@ mod tests {
         assert!(apply_put(&mut f, &[put("X", Some("a\0b"))]).is_err());
         assert_eq!(f.serialize(), "PORT=3010\n", "failed puts change nothing");
         // an old file that already has both cases can still be saved
-        let mut g = parse("Path=a\nPATH=b\n").0;
-        assert!(apply_put(&mut g, &[put("Path", None), put("PATH", None)]).is_ok());
+        let mut g = parse("Home=a\nHOME=b\n").0;
+        assert!(apply_put(&mut g, &[put("Home", None), put("HOME", None)]).is_ok());
+    }
+
+    #[test]
+    fn rejects_keys_that_change_loading_or_the_shell() {
+        let mut f = parse("PORT=3010\n").0;
+        assert_eq!(
+            apply_put(&mut f, &[put("LD_PRELOAD", Some("/tmp/x.so"))]).unwrap_err(),
+            "LD_PRELOAD is not allowed: it would change how programs load."
+        );
+        for k in [
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "GCONV_PATH",
+            "BASH_ENV",
+            "ENV",
+            "IFS",
+            "PS4",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "PROMPT_COMMAND",
+            "PATH",
+        ] {
+            assert!(
+                apply_put(&mut f, &[put(k, Some("x"))])
+                    .unwrap_err()
+                    .starts_with(&format!("{k} is not allowed")),
+                "{k}"
+            );
+        }
+        let (inc, errs) = parse("A=1\nBASH_ENV=/tmp/x\n");
+        let errs = paste_errors(&f, &inc, errs);
+        assert_eq!(
+            (errs[0].line, errs[0].message.as_str()),
+            (
+                2,
+                "BASH_ENV is not allowed: it would change how the shell runs commands."
+            )
+        );
+        assert_eq!(f.serialize(), "PORT=3010\n");
     }
 
     #[test]

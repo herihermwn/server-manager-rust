@@ -582,10 +582,18 @@ impl Ctx {
             return Ok(());
         }
         self.mark(step, "running", None).await;
-        let cmd = exec::run_shell_user_command(&format!("set -e\n{script}"), Some(&self.user))
+        // App variables are passed after the privilege drop (env -i argv), never to root.
+        let vars = dotenv(&self.app);
+        let (_, skipped) = exec::safe_app_env(&vars);
+        if !skipped.is_empty() {
+            self.log(&format!(
+                "warning: not passed to {step} (unsafe or reserved): {}",
+                skipped.join(", ")
+            ));
+        }
+        let cmd = exec::run_shell_user_command(&format!("set -e\n{script}"), Some(&self.user), &vars)
             .cwd(cwd)
             .timeout(Duration::from_secs(self.app.build_timeout_secs.max(60) as u64));
-        let cmd = dotenv(&self.app).into_iter().fold(cmd, |c, (k, v)| c.env(k, v));
         self.exec(step, cmd).await?;
         self.mark(step, "success", Some(0)).await;
         Ok(())
