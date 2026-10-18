@@ -1204,11 +1204,11 @@ mod tests {
         let base = std::env::temp_dir().join(format!("sm-db-perm-{}", std::process::id()));
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let dir = base.join("backups/postgres");
-        private_dir(dir).unwrap();
+        private_dir(&dir).unwrap();
         assert_eq!(mode(&dir), 0o700);
         // An existing 755 folder (as on the server) is tightened.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        private_dir(dir).unwrap();
+        private_dir(&dir).unwrap();
         assert_eq!(mode(&dir), 0o700);
         // A leftover world-readable .part is replaced by a 600 one.
         let part = dir.join("x-20261019-020000.dump.part");
