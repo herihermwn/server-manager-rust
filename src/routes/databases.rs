@@ -390,7 +390,7 @@ async fn backup_db(st: &AppState, pg: &Pg, name: &str) -> Result<BackupInfo, Str
 }
 
 async fn dump(pg: &Pg, name: &str, at: i64, dir: &std::path::Path) -> Result<BackupInfo, String> {
-    private_dir(&dir).map_err(|e| format!("Cannot prepare {}: {e}", dir.display()))?;
+    private_dir(dir).map_err(|e| format!("Cannot prepare {}: {e}", dir.display()))?;
     let file = backup_file_name(name, at);
     let (fin, part) = (dir.join(&file), dir.join(format!("{file}.part")));
     // Private from the first byte: pg_dump reopens this file for writing and keeps its mode.
@@ -414,7 +414,7 @@ async fn dump(pg: &Pg, name: &str, at: i64, dir: &std::path::Path) -> Result<Bac
     }
     std::fs::rename(&part, &fin).map_err(|e| format!("Cannot save the dump: {e}"))?;
     let size_bytes = std::fs::metadata(&fin).map(|m| m.len() as i64).unwrap_or(0);
-    let names: Vec<String> = std::fs::read_dir(&dir)
+    let names: Vec<String> = std::fs::read_dir(dir)
         .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
         .unwrap_or_default();
     for old in to_prune(&names, name, KEEP_BACKUPS) {
@@ -1204,11 +1204,11 @@ mod tests {
         let base = std::env::temp_dir().join(format!("sm-db-perm-{}", std::process::id()));
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let dir = base.join("backups/postgres");
-        private_dir(&dir).unwrap();
+        private_dir(dir).unwrap();
         assert_eq!(mode(&dir), 0o700);
         // An existing 755 folder (as on the server) is tightened.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        private_dir(&dir).unwrap();
+        private_dir(dir).unwrap();
         assert_eq!(mode(&dir), 0o700);
         // A leftover world-readable .part is replaced by a 600 one.
         let part = dir.join("x-20261019-020000.dump.part");
