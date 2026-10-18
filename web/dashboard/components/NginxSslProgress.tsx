@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { apiUrl } from "../lib/api";
 import { Button } from "./Button";
 import { LogView, type LogLine } from "./LogView";
 
@@ -30,7 +31,7 @@ export function NginxSslProgress({ siteId, onDone, onDismiss }: { siteId: number
   onDoneRef.current = onDone;
 
   useEffect(() => {
-    const es = new EventSource(`/api/sites/${siteId}/ssl/log`);
+    const es = new EventSource(apiUrl(`/api/sites/${siteId}/ssl/log`));
     const add = (e: MessageEvent) => setLines((p) => [...p.slice(-2000), { text: e.data }]);
     es.addEventListener("stdout", add);
     es.addEventListener("stderr", add);

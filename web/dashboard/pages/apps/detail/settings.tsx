@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../../../lib/api";
 import { navigate } from "../../../lib/router";
-import { SERVER } from "../../../lib/server";
+import { useAuth } from "../../../lib/auth";
 import { Button } from "../../../components/Button";
 import { InlineAlert } from "../../../components/Feedback";
 import { Checkbox, TextField, Textarea } from "../../../components/Input";
@@ -62,6 +62,7 @@ function ReadOnly({ label, value, helper, wide }: { label: string; value: string
 /** AppSettings.dc.html (default / delete). */
 export function AppSettingsTab({ app, reload }: { app: AppDetailData; reload: () => void }) {
   const toast = useToast();
+  const { publicUrl } = useAuth();
   const [f, setF] = useState<Form>(() => fromApp(app));
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState("");
@@ -165,7 +166,7 @@ export function AppSettingsTab({ app, reload }: { app: AppDetailData; reload: ()
           />
         </Group>
         <Group title="Auto-deploy" desc="GitHub calls the webhook on push. Only pushes to the deploy branch start a deploy.">
-          <ReadOnly label="Webhook URL" value={webhookUrl(app.webhookPath, SERVER.host)} wide />
+          <ReadOnly label="Webhook URL" value={webhookUrl(app.webhookPath, publicUrl)} wide />
           <ReadOnly label="Secret" value="••••••••••••••••••••••••" helper="The shared webhook secret lives in Settings." />
           <TextField label="Deploy timeout (min)" mono inputMode="numeric" value={f.timeoutMin} onChange={set("timeoutMin")} helper="Per build / before-restart command." />
         </Group>

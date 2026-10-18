@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api } from "../../../lib/api";
-import { formatWib, SERVER } from "../../../lib/server";
+import { formatWib } from "../../../lib/server";
+import { useAuth } from "../../../lib/auth";
 import { useEventStream } from "../../../lib/useEventStream";
 import { StatusBadge } from "../../../components/Badge";
 import { Button, IconButton } from "../../../components/Button";
@@ -87,8 +88,9 @@ function ReleaseCard({ app, behind }: { app: AppDetailData; behind?: string }) {
 
 function AutoDeployCard({ app, reload }: { app: AppDetailData; reload: () => void }) {
   const toast = useToast();
+  const { publicUrl } = useAuth();
   const [saving, setSaving] = useState(false);
-  const url = webhookUrl(app.webhookPath, SERVER.host);
+  const url = webhookUrl(app.webhookPath, publicUrl);
   const set = async (on: boolean) => {
     setSaving(true);
     try {

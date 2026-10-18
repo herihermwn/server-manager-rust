@@ -9,6 +9,13 @@
 //! `location /.well-known/acme-challenge/ { root /var/www/html; }`, so issuing and renewing never
 //! depend on the SSL block existing yet and certbot never rewrites our files (the `--nginx` plugin
 //! edits config in place, which would fight the generator and break the "restore on failure" rule).
+//!
+//! Static folders: nginx runs as www-data, /home/ubuntu is 0750 and the manager's UMask 0077 makes
+//! release files 0600, so saving a static site grants www-data access with POSIX ACLs
+//! (`grant_web_read`, needs the `acl` package): traverse-only (x) on each folder from the apps
+//! folder's parent down, read (rX) + the same default ACL on the served tree so new files inherit
+//! it. A folder under `<app>/current` or `<app>/releases` is granted on `<app>/releases`, so the
+//! next deploy's release is readable too. `<app>/shared` (.env) is never granted.
 
 use crate::{
     activity,
@@ -311,7 +318,13 @@ impl Draft {
                     ));
                 }
                 let p = validate::path_under(apps_dir, Path::new(raw))?;
-                let p = p.to_string_lossy().into_owned();
+                // Keep `<app>/current/...` as typed: resolving the link would pin the site to
+                // today's release, which a later clean-up deletes.
+                let p = if Path::new(raw).starts_with(apps_dir) {
+                    raw.trim_end_matches('/').to_owned()
+                } else {
+                    p.to_string_lossy().into_owned()
+                };
                 if !plain_path(&p) {
                     return Err(AppError::bad_request(
                         "Folder path has characters nginx config cannot hold.",
@@ -1141,6 +1154,78 @@ async fn preview(State(st): State<AppState>, UrlPath(id): UrlPath<i64>) -> ApiRe
     ))
 }
 
+/// (folders that get traverse-only, tree that gets read + default ACL) for a static root.
+fn acl_plan(apps_dir: &Path, root: &Path) -> Result<(Vec<PathBuf>, PathBuf), String> {
+    let rel = root.strip_prefix(apps_dir).map_err(|_| "Folder is outside the apps folder.".to_owned())?;
+    let app = rel.components().next().ok_or("Pick a folder inside an app.")?;
+    let app_dir = apps_dir.join(app);
+    let in_app = root.strip_prefix(&app_dir).unwrap_or(Path::new(""));
+    let releases = app_dir.join("releases");
+    let tree = if (in_app.starts_with("current") || in_app.starts_with("releases")) && releases.is_dir() {
+        releases
+    } else {
+        root.to_path_buf()
+    };
+    if app_dir.join("shared").starts_with(&tree) || tree.starts_with(app_dir.join("shared")) {
+        return Err("Not shared to nginx: the folder holds or is inside shared/ (the app's .env). Serve a build folder such as current/dist.".into());
+    }
+    let top = apps_dir.parent().unwrap_or(apps_dir);
+    let mut walk: Vec<PathBuf> = tree
+        .ancestors()
+        .skip(1)
+        .take_while(|a| a.starts_with(top) && *a != Path::new("/"))
+        .map(Path::to_path_buf)
+        .collect();
+    walk.reverse();
+    Ok((walk, tree))
+}
+
+/// Let www-data read a static site's folder (see the module docs). Err = a warning for the owner;
+/// the site itself is saved. No-op when the manager isn't root (macOS dev).
+async fn grant_web_read(apps_dir: &Path, root: &str) -> Result<(), String> {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let (walk, tree) = acl_plan(apps_dir, Path::new(root))?;
+    if !tree.exists() {
+        return Err(format!("{} doesn't exist yet. Save the site again after the first deploy so nginx may read it.", tree.display()));
+    }
+    let run = |args: Vec<String>| async move {
+        match Cmd::new("setfacl").args(args).timeout(Duration::from_secs(120)).output().await {
+            Ok(o) if o.exit.success() => Ok(()),
+            Ok(o) => Err(format!("setfacl: {}", o.stderr.trim())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err("setfacl is missing, so nginx can't read this folder. Install it with: sudo apt install acl".into())
+            }
+            Err(e) => Err(format!("setfacl: {e}")),
+        }
+    };
+    let mut a = vec!["-m".to_owned(), "u:www-data:x".to_owned(), "--".to_owned()];
+    a.extend(walk.iter().map(|p| p.to_string_lossy().into_owned()));
+    if !walk.is_empty() {
+        run(a).await?;
+    }
+    run(vec![
+        "-R".into(),
+        "-m".into(),
+        "u:www-data:rX,d:u:www-data:rX".into(),
+        "--".into(),
+        tree.to_string_lossy().into_owned(),
+    ])
+    .await
+}
+
+/// After a static site is saved: ACLs for nginx; a problem comes back as `warning`.
+async fn web_read_warning(st: &AppState, d: &Draft) -> Option<String> {
+    let root = d.root_path.as_deref().filter(|_| d.kind == Kind::Static)?;
+    let r = grant_web_read(&st.cfg.apps_dir, root).await.err();
+    if let Some(w) = &r {
+        eprintln!("[nginx] {}: {w}", d.domain);
+    }
+    r
+}
+
 async fn create(State(st): State<AppState>, Extension(a): Extension<Admin>, Json(input): Json<Input>) -> ApiResult {
     let d = Draft::build(&input, &st.cfg.apps_dir, app_port(&st, input.app_id).await?)?;
     taken(&st, &d.domain, None).await?;
@@ -1148,6 +1233,7 @@ async fn create(State(st): State<AppState>, Extension(a): Extension<Admin>, Json
         return Ok(apply_error(e, &d.domain));
     }
     let id = insert_or_update(&st, None, &d, true, None).await?;
+    let warning = web_read_warning(&st, &d).await;
     activity::log(
         &st.db,
         &a.username,
@@ -1157,7 +1243,7 @@ async fn create(State(st): State<AppState>, Extension(a): Extension<Admin>, Json
     )
     .await;
     let site = load(&st, id).await?;
-    Ok(Json(json!({ "site": site.json(), "needsCert": d.ssl && !site.cert_ready() })).into_response())
+    Ok(Json(json!({ "site": site.json(), "needsCert": d.ssl && !site.cert_ready(), "warning": warning })).into_response())
 }
 
 async fn insert_or_update(
@@ -1224,6 +1310,7 @@ async fn update(
         return Ok(apply_error(e, &d.domain));
     }
     insert_or_update(&st, Some(id), &d, old.enabled, expires).await?;
+    let warning = web_read_warning(&st, &d).await;
     activity::log(
         &st.db,
         &a.username,
@@ -1233,7 +1320,7 @@ async fn update(
     )
     .await;
     let site = load(&st, id).await?;
-    Ok(Json(json!({ "site": site.json(), "needsCert": d.ssl && !site.cert_ready() })).into_response())
+    Ok(Json(json!({ "site": site.json(), "needsCert": d.ssl && !site.cert_ready(), "warning": warning })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1830,6 +1917,29 @@ server {
         };
         assert!(Draft::build(&spaced, &apps, None).is_err());
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn static_acl_plan() {
+        let tmp = std::env::temp_dir().join(format!("sm-nginx-acl-{}", std::process::id()));
+        let apps = tmp.join("home/ubuntu/apps");
+        std::fs::create_dir_all(apps.join("web/releases/3/dist")).unwrap();
+        std::fs::create_dir_all(apps.join("plain/public")).unwrap();
+        let home = tmp.join("home/ubuntu");
+        // release layout → the whole releases/ tree, traverse on home, apps, app
+        let (walk, tree) = acl_plan(&apps, &apps.join("web/current/dist")).unwrap();
+        assert_eq!(tree, apps.join("web/releases"));
+        assert_eq!(walk, vec![home.clone(), apps.clone(), apps.join("web")]);
+        // plain folder → just that folder
+        let (walk, tree) = acl_plan(&apps, &apps.join("plain/public")).unwrap();
+        assert_eq!(tree, apps.join("plain/public"));
+        assert_eq!(walk, vec![home, apps.clone(), apps.join("plain")]);
+        // never the app folder itself or shared/ (.env)
+        assert!(acl_plan(&apps, &apps.join("web")).is_err());
+        assert!(acl_plan(&apps, &apps.join("web/shared")).is_err());
+        assert!(acl_plan(&apps, &apps.join("web/shared/public")).is_err());
+        assert!(acl_plan(&apps, Path::new("/etc")).is_err());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

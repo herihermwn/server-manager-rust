@@ -483,7 +483,7 @@ impl Thresholds {
     }
 }
 
-async fn thresholds(db: &sqlx::SqlitePool) -> Thresholds {
+pub async fn thresholds(db: &sqlx::SqlitePool) -> Thresholds {
     let pairs: Vec<(String, String)> =
         sqlx::query_as("SELECT key, value FROM settings WHERE key LIKE 'alert\\_%' ESCAPE '\\'")
             .fetch_all(db)

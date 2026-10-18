@@ -55,6 +55,9 @@ async fn main() {
     }
 
     let st = AppState::new(db, cfg, secret);
+    if let Err(e) = auth::restore_lockouts(&st).await {
+        eprintln!("[auth] could not load sign-in lockouts: {e}");
+    }
     routes::spawn_all(&st);
     let addr = format!("{}:{}", st.cfg.host, st.cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr)

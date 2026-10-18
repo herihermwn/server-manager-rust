@@ -121,11 +121,8 @@ export function fmtDuration(secs: number | null | undefined) {
 export const took = (d: { startedAt: number | null; finishedAt: number | null }, now = Date.now() / 1000) =>
   d.startedAt ? fmtDuration(Math.round((d.finishedAt ?? now) - d.startedAt)) : "—";
 
-/** Webhook URL GitHub should call. Through the SSH tunnel the origin is localhost, so use the server host. */
-export function webhookUrl(path: string, host: string) {
-  const o = window.location.origin;
-  return /\/\/([^/:]*localhost|127\.0\.0\.1)(:|\/|$)/.test(o) ? `https://${host}${path}` : `${o}${path}`;
-}
+/** Webhook URL GitHub should call: `publicUrl` from useAuth() (SM_PUBLIC_URL on the server) + /hooks/<app>. */
+export const webhookUrl = (path: string, publicUrl: string) => `${publicUrl}${path}`;
 
 export const copy = (text: string) => navigator.clipboard?.writeText(text);
 

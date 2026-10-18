@@ -123,8 +123,8 @@ Stroke icons `{ size?=18, strokeWidth?=2, className? }`: Plus, Refresh, Filter, 
 
 ## lib/
 
-- `api.ts` — `authFetch(url, init)` (cookie auth, 401 → back to sign-in) and `api<T>(url, { method?, body?, signal? })` (JSON both ways, throws `ApiError` with the server's `error` text, `.status`, `.body`).
-- `auth.tsx` — `AuthProvider`, `useAuth()` → `{ user, login, logout }`.
+- `api.ts` — `apiUrl(url)` turns `/api/...` into a page-relative `api/...` (the dashboard may run under a prefix such as `/server-manager/`; authFetch and useEventStream already use it, wrap any other fetch/EventSource URL), `authFetch(url, init)` (cookie auth, 401 → back to sign-in) and `api<T>(url, { method?, body?, signal? })` (JSON both ways, throws `ApiError` with the server's `error` text, `.status`, `.body`).
+- `auth.tsx` — `AuthProvider`, `useAuth()` → `{ user, publicUrl, login, logout }` (`publicUrl` = SM_PUBLIC_URL or the request host + prefix; build webhook links from it).
 - `router.ts` — `useHashRoute()`, `parseRoute(route)` → `{ segments, query }`, `navigate(path)`.
 - `useEventStream.ts` — `useEventStream(url | null)` → `{ lines, done, connected }` for the SSE endpoints built with `src/sse.rs`.
 - `server.ts` — `SERVER` (host / user / specs), `formatWib(unixSecs)`.

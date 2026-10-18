@@ -1420,14 +1420,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&db).await.unwrap();
-        let cfg = Config {
-            host: "127.0.0.1".into(),
-            port: 0,
-            data_dir: data.clone(),
-            apps_dir: apps_dir.clone(),
-            web_dist: "x".into(),
-            trust_proxy: false,
-        };
+        let cfg = Config::test(data.clone(), apps_dir.clone());
         let st = AppState::new(db, cfg, vec![0; 32]);
         sqlx::query("INSERT INTO apps (name, repo_url, branch, path, start_cmd, port, keep_releases) VALUES ('demo', ?, 'main', ?, 'true', 3999, 2)")
             .bind(src.to_string_lossy())

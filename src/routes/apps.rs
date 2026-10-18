@@ -218,13 +218,15 @@ async fn port_problem(st: &AppState, port: i64, except: Option<i64>) -> Result<O
     Ok(None)
 }
 
+/// First free port in the Settings port range (default 3001-3999).
 async fn suggest_port(st: &AppState) -> Result<i64, AppError> {
-    for p in 3001..3999 {
+    let (from, to) = super::settings::port_range(st).await;
+    for p in from..=to {
         if port_problem(st, p, None).await?.is_none() {
             return Ok(p);
         }
     }
-    Ok(3001)
+    Ok(from)
 }
 
 // ---------- commands ----------
@@ -363,7 +365,13 @@ fn systemd_quote(s: &str) -> String {
     out
 }
 
-/// System unit `app-<name>.service`, run as `user`. A crash loop (15 starts in 5 min) ends in the
+/// Removed from the unit's environment after `EnvironmentFile=` is read (UnsetEnvironment= is
+/// applied last), so a shared/.env can't change how programs load or how bash starts.
+const UNIT_UNSET: &str =
+    "LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG GCONV_PATH BASH_ENV ENV IFS PS4 SHELLOPTS BASHOPTS PROMPT_COMMAND";
+
+/// System unit `app-<name>.service`, run as `user`. systemd lets EnvironmentFile= win over
+/// Environment= whatever the order, so PATH is forced again by `env PATH=…` in ExecStart. A crash loop (15 starts in 5 min) ends in the
 /// failed state = "crashed".
 pub fn unit_file(name: &str, dir: &FsPath, port: Option<i64>, start: &str, user: &RunAs) -> String {
     let d = dir.display();
@@ -382,16 +390,18 @@ pub fn unit_file(name: &str, dir: &FsPath, port: Option<i64>, start: &str, user:
          Group={g}\n\
          WorkingDirectory={d}/current\n\
          Environment=HOME={h}\n\
-         Environment=PATH={path}\n\
          {port_line}\
          EnvironmentFile=-{d}/shared/.env\n\
-         ExecStart=/bin/bash -lc {}\n\
+         Environment=PATH={path}\n\
+         UnsetEnvironment={UNIT_UNSET}\n\
+         ExecStart=/usr/bin/env {} /bin/bash -lc {}\n\
          Restart=on-failure\n\
          RestartSec=2\n\
          TimeoutStopSec=20\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
+        systemd_quote(&format!("PATH={}", user.path())),
         systemd_quote(start),
         u = user.user,
         g = user.gid,
@@ -430,24 +440,57 @@ pub async fn restart_app(name: &str) -> Result<(), String> {
 /// git (as the manager, i.e. root) with the server deploy key, no prompts. Its global config is
 /// `<data>/gitconfig` with `safe.directory=*`, because app folders (and local source repos) belong
 /// to other users; `-c` would not reach the upload-pack of a local clone. Known hosts: data dir.
+///
+/// During a key rotation (Settings › Generate new key) both keys are offered, the current one
+/// first: it is still on every repo, and GitHub stops at the first key that authenticates, even
+/// when that key has no access to the repo. The HTTPS token (if set) is given to github.com only.
 pub fn git(st: &AppState) -> Cmd {
-    let key = deploy_key_path(st);
+    let mut keys = vec![deploy_key_path(st)];
+    let next = next_key_path(st);
+    if next.exists() {
+        keys.push(next);
+    }
+    git_with_keys(st, &keys)
+}
+
+/// git with exactly these deploy keys (Settings › Check access tries the new key alone).
+pub fn git_with_keys(st: &AppState, keys: &[PathBuf]) -> Cmd {
     let gitconfig = st.cfg.data_dir.join("gitconfig");
     if !gitconfig.exists() {
         let _ = std::fs::write(&gitconfig, "[safe]\n\tdirectory = *\n");
     }
-    Cmd::new("git")
+    let mut cmd = Cmd::new("git")
         .env("GIT_CONFIG_GLOBAL", gitconfig.to_string_lossy())
-        .env(
-            "GIT_SSH_COMMAND",
-            format!(
-                "ssh -i '{}' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile='{}' -o BatchMode=yes",
-                key.display(),
-                st.cfg.data_dir.join("known_hosts").display()
-            ),
-        )
+        .env("GIT_SSH_COMMAND", ssh_command(st, keys))
         .env("GIT_TERMINAL_PROMPT", "0")
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(60));
+    let token = https_token_path(st);
+    if token.exists() {
+        // Credential helper reads the 600 file at use time: the token is never in argv or env.
+        cmd = cmd
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "credential.https://github.com.helper")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                format!(
+                    "!f() {{ echo username=x-access-token; printf 'password='; cat '{}'; echo; }}; f",
+                    token.display()
+                ),
+            )
+            .env("GIT_CONFIG_KEY_1", "credential.https://github.com.useHttpPath")
+            .env("GIT_CONFIG_VALUE_1", "false");
+    }
+    cmd
+}
+
+/// `-F /dev/null`: no ~/.ssh/config, whose IdentityFile lines would be offered too (IdentitiesOnly
+/// doesn't drop them), so "check access with the new key" really uses only that key.
+fn ssh_command(st: &AppState, keys: &[PathBuf]) -> String {
+    let ids: String = keys.iter().map(|k| format!("-i '{}' ", k.display())).collect();
+    format!(
+        "ssh -F /dev/null {ids}-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile='{}' -o BatchMode=yes",
+        st.cfg.data_dir.join("known_hosts").display()
+    )
 }
 
 /// Last useful stderr lines of a failed git call, with a hint for the deploy-key case.
@@ -469,19 +512,57 @@ pub fn git_error(stderr: &str) -> String {
 
 // ---------- deploy key ----------
 
-fn deploy_key_path(st: &AppState) -> PathBuf {
+pub fn deploy_key_path(st: &AppState) -> PathBuf {
     st.cfg.data_dir.join("deploy_key")
+}
+
+/// The new key during a rotation; becomes `deploy_key` when the old one is removed.
+pub fn next_key_path(st: &AppState) -> PathBuf {
+    st.cfg.data_dir.join("deploy_key_next")
+}
+
+/// Settings › HTTPS token (mode 600, never sent back to the browser).
+pub fn https_token_path(st: &AppState) -> PathBuf {
+    st.cfg.data_dir.join("https_token")
 }
 
 static KEYGEN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Create `<data>/deploy_key` (ed25519, no passphrase) if missing.
-async fn ensure_deploy_key(st: &AppState) -> ApiResult<PathBuf> {
+pub async fn ensure_deploy_key(st: &AppState) -> ApiResult<PathBuf> {
     let _g = KEYGEN.lock().await;
     let path = deploy_key_path(st);
-    if path.exists() {
-        return Ok(path);
+    if !path.exists() {
+        keygen(&path).await?;
     }
+    Ok(path)
+}
+
+/// Start a rotation: `<data>/deploy_key_next`, next to the current key (which keeps working).
+/// Already rotating → the existing new key.
+pub async fn create_next_key(st: &AppState) -> ApiResult<PathBuf> {
+    ensure_deploy_key(st).await?;
+    let _g = KEYGEN.lock().await;
+    let path = next_key_path(st);
+    if !path.exists() {
+        keygen(&path).await?;
+    }
+    Ok(path)
+}
+
+/// End a rotation: the new key replaces the old one, which is deleted.
+pub async fn promote_next_key(st: &AppState) -> ApiResult<()> {
+    let _g = KEYGEN.lock().await;
+    let (next, cur) = (next_key_path(st), deploy_key_path(st));
+    if !next.exists() {
+        return Err(conflict("There is no new key yet. Generate one first."));
+    }
+    std::fs::rename(&next, &cur)?;
+    std::fs::rename(next.with_extension("pub"), cur.with_extension("pub"))?;
+    Ok(())
+}
+
+async fn keygen(path: &FsPath) -> ApiResult<()> {
     let host = Cmd::new("hostname")
         .output()
         .await
@@ -500,14 +581,24 @@ async fn ensure_deploy_key(st: &AppState) -> ApiResult<PathBuf> {
     if !o.exit.success() {
         return Err(AppError::Internal(format!("ssh-keygen: {}", o.stderr.trim())));
     }
-    Ok(path)
+    Ok(())
 }
 
 /// GET /apps/deploy-key → public key + fingerprint (never the private key).
 async fn deploy_key(State(st): State<AppState>) -> ApiResult<Json<Value>> {
     let path = ensure_deploy_key(&st).await?;
+    Ok(Json(json!({ "data": key_info(&path).await? })))
+}
+
+/// Public half of a key file: {publicKey, fingerprint, type, createdAt}.
+pub async fn key_info(path: &FsPath) -> ApiResult<Value> {
     let pub_path = path.with_extension("pub");
     let public_key = std::fs::read_to_string(&pub_path)?.trim().to_owned();
+    let created = std::fs::metadata(path)?
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
     let o = Cmd::new("ssh-keygen")
         .arg("-lf")
         .arg(pub_path.to_string_lossy())
@@ -523,9 +614,7 @@ async fn deploy_key(State(st): State<AppState>) -> ApiResult<Json<Value>> {
         .unwrap_or_default()
         .trim_matches(['(', ')'])
         .to_lowercase();
-    Ok(Json(
-        json!({ "data": { "publicKey": public_key, "fingerprint": fingerprint, "type": kind } }),
-    ))
+    Ok(json!({ "publicKey": public_key, "fingerprint": fingerprint, "type": kind, "createdAt": created }))
 }
 
 // ---------- wizard checks ----------
@@ -1524,11 +1613,47 @@ mod tests {
         assert!(u.contains("StartLimitBurst=15\n") && u.contains("StartLimitIntervalSec=300\n"));
         assert!(u.contains("Restart=on-failure\n"));
         assert!(
-            u.contains(r#"ExecStart=/bin/bash -lc 'echo \'$$HOME\' "50%%" \\n && ./run'"#),
+            u.contains(r#"/bin/bash -lc 'echo \'$$HOME\' "50%%" \\n && ./run'"#),
             "{u}"
         );
+        // .env can't override PATH or inject loader / shell-startup variables
+        let env_at = u.find("EnvironmentFile=").unwrap();
+        assert!(u.find("Environment=PATH=").unwrap() > env_at);
+        assert!(u.find("UnsetEnvironment=").unwrap() > env_at);
+        for k in ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG", "GCONV_PATH", "BASH_ENV", "ENV", "IFS", "PS4", "SHELLOPTS", "BASHOPTS", "PROMPT_COMMAND"] {
+            assert!(UNIT_UNSET.split(' ').any(|x| x == k), "{k}");
+        }
+        assert!(u.contains("UnsetEnvironment=LD_PRELOAD "));
+        assert!(u.contains("ExecStart=/usr/bin/env 'PATH=/home/ubuntu/.bun/bin:/home/ubuntu/.cargo/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin' /bin/bash -lc '"), "{u}");
         assert_eq!(systemd_quote("a"), "'a'");
         assert!(!unit_file("x", FsPath::new("/a"), None, "x", &user).contains("PORT"));
+    }
+
+    #[tokio::test]
+    async fn key_rotation_keeps_the_old_key() {
+        let d = std::env::temp_dir().join(format!("sm-keyrot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let db = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        let st = AppState::new(db, crate::config::Config::test(d.clone(), d.clone()), vec![0; 32]);
+        let cur = ensure_deploy_key(&st).await.unwrap();
+        let old = std::fs::read_to_string(cur.with_extension("pub")).unwrap();
+        assert!(promote_next_key(&st).await.is_err(), "nothing to promote yet");
+        let next = create_next_key(&st).await.unwrap();
+        let new = std::fs::read_to_string(next.with_extension("pub")).unwrap();
+        assert_ne!(old, new);
+        assert_eq!(create_next_key(&st).await.unwrap(), next, "second click reuses the new key");
+        // both offered, current first; the check uses the new key alone
+        let ssh = ssh_command(&st, &[cur.clone(), next.clone()]);
+        let (i_cur, i_next) = (ssh.find("deploy_key'").unwrap(), ssh.find("deploy_key_next'").unwrap());
+        assert!(i_cur < i_next, "{ssh}");
+        assert_eq!(std::fs::read_to_string(cur.with_extension("pub")).unwrap(), old, "old key untouched");
+        // remove old → new key is the key
+        promote_next_key(&st).await.unwrap();
+        assert_eq!(std::fs::read_to_string(cur.with_extension("pub")).unwrap(), new);
+        assert!(!next.exists() && !next.with_extension("pub").exists());
+        assert_eq!(key_info(&cur).await.unwrap()["publicKey"], new.trim());
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

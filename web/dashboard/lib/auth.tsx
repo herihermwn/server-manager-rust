@@ -11,6 +11,8 @@ export type LoginResult = { ok: true } | { ok: false; error: string; triesLeft?:
 interface AuthContextType {
   /** undefined while the session is checked, null when signed out. */
   user: User | null | undefined;
+  /** Public base URL of this dashboard (SM_PUBLIC_URL, else the request host), no trailing slash. */
+  publicUrl: string;
   login: (username: string, password: string) => Promise<LoginResult>;
   logout: () => Promise<void>;
 }
@@ -25,10 +27,14 @@ export function useAuth() {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null | undefined>(undefined);
+  const [publicUrl, setPublicUrl] = useState(() => (window.location.origin + window.location.pathname).replace(/\/[^/]*$/, ""));
 
   useEffect(() => {
-    api<{ user: User }>("/api/auth/me")
-      .then((r) => setUser(r.user))
+    api<{ user: User; publicUrl?: string }>("/api/auth/me")
+      .then((r) => {
+        setUser(r.user);
+        if (r.publicUrl) setPublicUrl(r.publicUrl);
+      })
       .catch(() => setUser(null));
     const expired = () => setUser(null);
     window.addEventListener("auth:expired", expired);
@@ -37,8 +43,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(async (username: string, password: string): Promise<LoginResult> => {
     try {
-      const r = await api<{ user: User }>("/api/auth/login", { body: { username, password } });
+      const r = await api<{ user: User; publicUrl?: string }>("/api/auth/login", { body: { username, password } });
       setUser(r.user);
+      if (r.publicUrl) setPublicUrl(r.publicUrl);
       return { ok: true };
     } catch (e) {
       if (e instanceof ApiError) {
@@ -55,5 +62,5 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     window.location.hash = "/";
   }, []);
 
-  return <AuthContext.Provider value={{ user, login, logout }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={{ user, publicUrl, login, logout }}>{children}</AuthContext.Provider>;
 }

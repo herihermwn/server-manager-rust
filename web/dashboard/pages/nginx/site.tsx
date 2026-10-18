@@ -130,11 +130,13 @@ export function NginxSite({ id }: { id: string }) {
     setSaveError(null);
     setFailure(null);
     try {
-      const r = await api<{ site: NginxSite; needsCert: boolean }>(isNew ? "/api/sites" : `/api/sites/${id}`, {
+      const r = await api<{ site: NginxSite; needsCert: boolean; warning?: string | null }>(isNew ? "/api/sites" : `/api/sites/${id}`, {
         method: isNew ? "POST" : "PUT",
         body,
       });
-      toast({ title: "Site saved", body: "nginx -t passed and nginx was reloaded.", tone: "success" });
+      // Static folder: the server grants nginx (www-data) read access with ACLs; a problem comes back here.
+      if (r.warning) toast({ title: "Saved, but nginx can't read the folder", body: r.warning, tone: "error" });
+      else toast({ title: "Site saved", body: "nginx -t passed and nginx was reloaded.", tone: "success" });
       if (r.needsCert && body.sslEmail) {
         apply(r.site);
         if (await startSsl(r.site.id)) return;

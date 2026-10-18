@@ -1,8 +1,11 @@
 //! Owner login: argon2id hashes in `admin_users`, HS256 JWT in an HttpOnly SameSite=Strict cookie,
-//! per-IP lockout, and the `require_auth` middleware that guards every /api route except login.
+//! per-IP lockout (kept in SQLite `login_fails`, so a restart doesn't unlock), a global soft limit
+//! against distributed guessing, and the `require_auth` middleware that guards every /api route
+//! except login. Logout bumps `token_version`, so the token is dead server-side too.
 
 use crate::{
     activity,
+    config::Config,
     http::{ApiResult, AppError, now},
     state::AppState,
 };
@@ -25,12 +28,21 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::{collections::HashMap, net::SocketAddr, path::Path, sync::LazyLock};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    path::Path,
+    sync::LazyLock,
+    time::Duration,
+};
 
 pub const SESSION_SECS: i64 = 12 * 60 * 60;
 const COOKIE: &str = "sm_session";
 const MAX_FAILS: u32 = 5;
 const LOCK_SECS: i64 = 15 * 60;
+/// More failed sign-ins than this in a minute, across all IPs, turns on the soft limit.
+const GLOBAL_FAILS: usize = 30;
+const SLOW_DELAY: Duration = Duration::from_secs(2);
 pub const MIN_PASSWORD: usize = 10;
 
 // ---------- lockout ----------
@@ -43,16 +55,19 @@ struct Entry {
 }
 
 /// Failed sign-ins per IP. The attempt is counted *before* the password is checked, so parallel
-/// requests can't sneak past the limit.
-// ponytail: in memory, so a restart clears locks; persist to SQLite if that ever matters.
+/// requests can't sneak past the limit. Written through to `login_fails` (see `attempt` below).
+/// `recent` = times of failed passwords from any IP, for the global soft limit (memory only).
 #[derive(Default)]
-pub struct Lockout(HashMap<String, Entry>);
+pub struct Lockout {
+    ips: HashMap<String, Entry>,
+    recent: VecDeque<i64>,
+}
 
 impl Lockout {
     /// `Err(seconds)` while locked. `Ok(tries_left)` = tries left if *this* attempt fails.
     pub fn attempt(&mut self, ip: &str, now: i64) -> Result<u32, i64> {
-        self.0.retain(|_, e| e.locked_until > now || now - e.last < LOCK_SECS);
-        let e = self.0.entry(ip.to_owned()).or_default();
+        self.ips.retain(|_, e| e.locked_until > now || now - e.last < LOCK_SECS);
+        let e = self.ips.entry(ip.to_owned()).or_default();
         if e.locked_until > now {
             return Err(e.locked_until - now);
         }
@@ -65,9 +80,77 @@ impl Lockout {
     }
 
     pub fn success(&mut self, ip: &str) {
-        self.0.remove(ip);
+        self.ips.remove(ip);
+    }
+
+    /// (fails, last, locked_until) for SQLite.
+    fn get(&self, ip: &str) -> Option<(u32, i64, i64)> {
+        self.ips.get(ip).map(|e| (e.fails, e.last, e.locked_until))
+    }
+
+    fn restore(&mut self, ip: String, fails: u32, last: i64, locked_until: i64) {
+        self.ips.insert(ip, Entry { fails, last, locked_until });
+    }
+
+    /// A wrong password from any IP.
+    fn note_fail(&mut self, now: i64) {
+        self.recent.push_back(now);
+        if self.recent.len() > 10 * GLOBAL_FAILS {
+            self.recent.pop_front();
+        }
+    }
+
+    /// More than GLOBAL_FAILS wrong passwords in the last minute, all IPs together.
+    fn busy(&mut self, now: i64) -> bool {
+        while self.recent.front().is_some_and(|t| now - t >= 60) {
+            self.recent.pop_front();
+        }
+        self.recent.len() > GLOBAL_FAILS
     }
 }
+
+/// Count a sign-in attempt for `ip` and write the entry to `login_fails`.
+async fn attempt(st: &AppState, ip: &str) -> ApiResult<Result<u32, i64>> {
+    let t = now();
+    let (res, snap) = {
+        let mut l = st.lockout.lock().unwrap_or_else(|e| e.into_inner());
+        let r = l.attempt(ip, t);
+        (r, l.get(ip))
+    };
+    if let Some((fails, last, until)) = snap {
+        sqlx::query(
+            "INSERT INTO login_fails (ip, fails, last, locked_until) VALUES (?, ?, ?, ?) \
+             ON CONFLICT (ip) DO UPDATE SET fails = excluded.fails, last = excluded.last, locked_until = excluded.locked_until",
+        )
+        .bind(ip)
+        .bind(fails)
+        .bind(last)
+        .bind(until)
+        .execute(&st.db)
+        .await?;
+    }
+    sqlx::query("DELETE FROM login_fails WHERE locked_until <= ?1 AND ?1 - last >= ?2")
+        .bind(t)
+        .bind(LOCK_SECS)
+        .execute(&st.db)
+        .await?;
+    Ok(res)
+}
+
+/// Boot: load the lockouts that are still running from `login_fails`.
+pub async fn restore_lockouts(st: &AppState) -> Result<(), sqlx::Error> {
+    let rows: Vec<(String, i64, i64, i64)> =
+        sqlx::query_as("SELECT ip, fails, last, locked_until FROM login_fails").fetch_all(&st.db).await?;
+    let mut l = st.lockout.lock().unwrap_or_else(|e| e.into_inner());
+    for (ip, fails, last, until) in rows {
+        l.restore(ip, fails.clamp(0, MAX_FAILS as i64) as u32, last, until);
+    }
+    Ok(())
+}
+
+/// Serialises the delayed attempts while the soft limit is on, so parallel requests can't
+/// overlap their delays: at most one password check per SLOW_DELAY server-wide.
+static SLOW: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ---------- tokens ----------
 
@@ -187,12 +270,14 @@ fn cookie_token(h: &HeaderMap) -> Option<&str> {
         .find_map(|kv| kv.trim().strip_prefix(COOKIE)?.strip_prefix('='))
 }
 
-/// `Secure` only when nginx says the browser came over https; the SSH tunnel is plain http on localhost.
-fn session_cookie(token: &str, max_age: i64, h: &HeaderMap) -> HeaderValue {
-    let secure = h.get("x-forwarded-proto").is_some_and(|v| v == "https");
+/// Path `<SM_BASE_PATH>/api` (nginx strips the prefix, the browser still sees it). `Secure` with
+/// `SM_COOKIE_SECURE=1`: behind Cloudflare Flexible nginx itself only sees http, so it is config,
+/// not a header. The SSH tunnel is plain http on localhost and leaves it off.
+fn session_cookie(token: &str, max_age: i64, cfg: &Config) -> HeaderValue {
     let v = format!(
-        "{COOKIE}={token}; Path=/api; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
-        if secure { "; Secure" } else { "" }
+        "{COOKIE}={token}; Path={}/api; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        cfg.base_path,
+        if cfg.cookie_secure { "; Secure" } else { "" }
     );
     HeaderValue::from_str(&v).expect("cookie is ascii")
 }
@@ -224,11 +309,21 @@ async fn login(
     Json(b): Json<LoginBody>,
 ) -> ApiResult {
     let ip = client_ip(&headers, peer, st.cfg.trust_proxy);
-    let attempt = st.lockout.lock().unwrap_or_else(|e| e.into_inner()).attempt(&ip, now());
-    let tries_left = match attempt {
+    let tries_left = match attempt(&st, &ip).await? {
         Ok(n) => n,
         Err(secs) => return Ok(locked(secs)),
     };
+    // Soft limit: many wrong passwords server-wide → every attempt waits its turn for 2 s.
+    let busy = st.lockout.lock().unwrap_or_else(|e| e.into_inner()).busy(now());
+    if busy {
+        match tokio::time::timeout(Duration::from_secs(10), SLOW.lock()).await {
+            Ok(_turn) => tokio::time::sleep(SLOW_DELAY).await,
+            Err(_) => {
+                let body = json!({ "error": "Too many sign-in attempts on this server right now. Try again in a minute.", "retryAfter": 60 });
+                return Ok((StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response());
+            }
+        }
+    }
 
     let row: Option<(i64, String, i64)> =
         sqlx::query_as("SELECT id, password_hash, token_version FROM admin_users WHERE username = ?")
@@ -237,6 +332,7 @@ async fn login(
             .await?;
     let ok = check_password(b.password, row.as_ref().map(|r| r.1.clone())).await?;
     let Some((id, _, ver)) = row.filter(|_| ok) else {
+        st.lockout.lock().unwrap_or_else(|e| e.into_inner()).note_fail(now());
         if tries_left == 0 {
             activity::log(
                 &st.db,
@@ -253,6 +349,7 @@ async fn login(
     };
 
     st.lockout.lock().unwrap_or_else(|e| e.into_inner()).success(&ip);
+    sqlx::query("DELETE FROM login_fails WHERE ip = ?").bind(&ip).execute(&st.db).await?;
     let t = now();
     sqlx::query("UPDATE admin_users SET last_login_at = ? WHERE id = ?")
         .bind(t)
@@ -261,10 +358,15 @@ async fn login(
         .await?;
     activity::log(&st.db, &b.username, "auth.login", &ip, "").await;
     let token = sign(&st.jwt_secret, id, ver, t)?;
-    let body = json!({ "user": { "username": b.username }, "expiresAt": (t + SESSION_SECS) * 1000 });
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    let body = json!({
+        "user": { "username": b.username },
+        "expiresAt": (t + SESSION_SECS) * 1000,
+        "publicUrl": st.cfg.public_url(host),
+    });
     Ok(with_cookie(
         Json(body).into_response(),
-        session_cookie(&token, SESSION_SECS, &headers),
+        session_cookie(&token, SESSION_SECS, &st.cfg),
     ))
 }
 
@@ -279,15 +381,29 @@ fn locked(secs: i64) -> Response {
     res
 }
 
-async fn logout(headers: HeaderMap) -> Response {
-    with_cookie(
-        Json(json!({ "ok": true })).into_response(),
-        session_cookie("", 0, &headers),
-    )
+/// Bump token_version: this token (and every other session of the owner) stops working now,
+/// not when it expires. Single owner, so "sign out" = sign out everywhere.
+async fn revoke_sessions(db: &SqlitePool, user_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE admin_users SET token_version = token_version + 1 WHERE id = ?")
+        .bind(user_id)
+        .execute(db)
+        .await
+        .map(|_| ())
 }
 
-async fn me(Extension(a): Extension<Admin>) -> Json<serde_json::Value> {
-    Json(json!({ "user": { "username": a.username } }))
+async fn logout(State(st): State<AppState>, Extension(a): Extension<Admin>) -> ApiResult {
+    revoke_sessions(&st.db, a.id).await?;
+    activity::log(&st.db, &a.username, "auth.logout", &a.username, "sessions revoked").await;
+    Ok(with_cookie(
+        Json(json!({ "ok": true })).into_response(),
+        session_cookie("", 0, &st.cfg),
+    ))
+}
+
+/// The owner + the public base URL of this dashboard (webhook links are built from it).
+async fn me(State(st): State<AppState>, Extension(a): Extension<Admin>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    Json(json!({ "user": { "username": a.username }, "publicUrl": st.cfg.public_url(host) }))
 }
 
 #[derive(Deserialize)]
@@ -301,7 +417,6 @@ struct PasswordBody {
 async fn change_password(
     State(st): State<AppState>,
     Extension(a): Extension<Admin>,
-    headers: HeaderMap,
     Json(b): Json<PasswordBody>,
 ) -> ApiResult {
     let hash: Option<String> = sqlx::query_scalar("SELECT password_hash FROM admin_users WHERE id = ?")
@@ -336,7 +451,7 @@ async fn change_password(
     let token = sign(&st.jwt_secret, a.id, ver, now())?;
     Ok(with_cookie(
         Json(json!({ "ok": true })).into_response(),
-        session_cookie(&token, SESSION_SECS, &headers),
+        session_cookie(&token, SESSION_SECS, &st.cfg),
     ))
 }
 
@@ -354,20 +469,22 @@ pub fn routes() -> Router<AppState> {
         .route("/auth/password", post(change_password))
 }
 
-/// 401 unless the cookie holds a valid, unexpired JWT whose token_version matches the user row.
+/// The owner, if `token` is a valid, unexpired JWT whose token_version matches the user row.
+async fn session_user(st: &AppState, token: Option<&str>) -> Option<Admin> {
+    let c = verify(&st.jwt_secret, token?)?;
+    sqlx::query_as::<_, (String, i64)>("SELECT username, token_version FROM admin_users WHERE id = ?")
+        .bind(c.sub)
+        .fetch_optional(&st.db)
+        .await
+        .ok()
+        .flatten()
+        .filter(|(_, ver)| *ver == c.ver)
+        .map(|(username, _)| Admin { id: c.sub, username })
+}
+
+/// 401 unless the cookie holds a live session (`session_user`).
 pub async fn require_auth(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
-    let claims = cookie_token(req.headers()).and_then(|t| verify(&st.jwt_secret, t));
-    let user = match claims {
-        Some(c) => sqlx::query_as::<_, (String, i64)>("SELECT username, token_version FROM admin_users WHERE id = ?")
-            .bind(c.sub)
-            .fetch_optional(&st.db)
-            .await
-            .ok()
-            .flatten()
-            .filter(|(_, ver)| *ver == c.ver)
-            .map(|(username, _)| Admin { id: c.sub, username }),
-        None => None,
-    };
+    let user = session_user(&st, cookie_token(req.headers())).await;
     match user {
         Some(a) => {
             req.extensions_mut().insert(a);
@@ -503,6 +620,71 @@ mod tests {
         assert_eq!(cookie_token(&h), Some("abc.def"));
         h.insert(header::COOKIE, "sm_sessionx=nope".parse().unwrap());
         assert_eq!(cookie_token(&h), None);
+    }
+
+    #[test]
+    fn global_soft_limit() {
+        let mut l = Lockout::default();
+        for _ in 0..GLOBAL_FAILS {
+            l.note_fail(100);
+        }
+        assert!(!l.busy(100), "30 a minute is still fine");
+        l.note_fail(120);
+        assert!(l.busy(120), "31st failure in a minute turns it on");
+        assert!(!l.busy(160), "the first 30 are older than a minute now");
+    }
+
+    #[test]
+    fn cookie_path_follows_base_path() {
+        let mut c = Config::test("/d".into(), "/a".into());
+        let v = session_cookie("t", 60, &c);
+        assert_eq!(v, "sm_session=t; Path=/api; HttpOnly; SameSite=Strict; Max-Age=60");
+        c.base_path = "/server-manager".into();
+        c.cookie_secure = true;
+        let v = session_cookie("t", 0, &c);
+        assert_eq!(v, "sm_session=t; Path=/server-manager/api; HttpOnly; SameSite=Strict; Max-Age=0; Secure");
+    }
+
+    async fn test_state(db: SqlitePool) -> AppState {
+        AppState::new(db, Config::test("/tmp".into(), "/tmp".into()), vec![7; 32])
+    }
+
+    async fn memory_db() -> SqlitePool {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn lockout_survives_restart() {
+        let db = memory_db().await;
+        let st = test_state(db.clone()).await;
+        for left in [4, 3, 2, 1, 0] {
+            assert_eq!(attempt(&st, "5.5.5.5").await.unwrap(), Ok(left));
+        }
+        // "restart": a fresh state on the same database
+        let st2 = test_state(db).await;
+        assert_eq!(attempt(&st2, "6.6.6.6").await.unwrap(), Ok(4));
+        restore_lockouts(&st2).await.unwrap();
+        assert!(attempt(&st2, "5.5.5.5").await.unwrap().is_err(), "still locked after restart");
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_the_token() {
+        let db = memory_db().await;
+        let st = test_state(db.clone()).await;
+        sqlx::query("INSERT INTO admin_users (id, username, password_hash) VALUES (1, 'heri', 'x')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let t = sign(&st.jwt_secret, 1, 0, now()).unwrap();
+        assert_eq!(session_user(&st, Some(&t)).await.map(|a| a.username).as_deref(), Some("heri"));
+        revoke_sessions(&db, 1).await.unwrap();
+        assert!(session_user(&st, Some(&t)).await.is_none(), "old token is dead after logout");
     }
 
     #[test]

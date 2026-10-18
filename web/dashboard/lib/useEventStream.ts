@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { apiUrl } from "./api";
 
 /** One line from src/sse.rs (`stdout` / `stderr` events). */
 export interface StreamLine {
@@ -28,7 +29,7 @@ export function useEventStream(url: string | null) {
     setLines([]);
     setDone(null);
     if (!url) return;
-    const es = new EventSource(url);
+    const es = new EventSource(apiUrl(url));
     const add = (stream: StreamLine["stream"]) => (e: MessageEvent) =>
       setLines((prev) => {
         const next = prev.length >= MAX_LINES ? prev.slice(-MAX_LINES + 1) : prev.slice();

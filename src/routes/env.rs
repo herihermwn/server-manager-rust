@@ -1273,14 +1273,7 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
-        let cfg = Config {
-            host: "127.0.0.1".into(),
-            port: 0,
-            data_dir: d.clone(),
-            apps_dir: apps.clone(),
-            web_dist: d.clone(),
-            trust_proxy: false,
-        };
+        let cfg = Config::test(d.clone(), apps.clone());
         let st = AppState::new(db, cfg, vec![0; 32]);
 
         let vars = vec![("DATABASE_URL".to_string(), "postgres://u:hunter2pw@h/db".to_string())];
