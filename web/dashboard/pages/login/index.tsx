@@ -51,9 +51,8 @@ export function Login() {
         <div className="flex flex-col gap-2 font-mono text-13 leading-5 text-console-muted">
           <span className="inline-flex items-center gap-2 text-console-text">
             <span className="h-2 w-2 rounded-full bg-term-ok" aria-hidden="true" />
-            {SERVER.user}@{SERVER.host}
+            {SERVER.host}
           </span>
-          <span>{SERVER.specs}</span>
         </div>
       </aside>
 

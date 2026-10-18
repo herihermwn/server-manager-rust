@@ -16,7 +16,7 @@ export class ApiError extends Error {
 
 /**
  * "/api/x" → "api/x", which the browser resolves against the page URL. So the same build works at
- * http://localhost:3900/ and behind nginx at https://herani.id/server-manager/ (prefix stripped by
+ * http://localhost:3900/ and behind nginx at https://example.com/server-manager/ (prefix stripped by
  * nginx). Use it for every URL handed to fetch / EventSource.
  */
 export const apiUrl = (url: string) => (url.startsWith("/api/") ? url.slice(1) : url);

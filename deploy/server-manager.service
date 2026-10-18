@@ -1,8 +1,10 @@
-# Installed by scripts/deploy-to-server.sh to /etc/systemd/system/server-manager.service.
-# Runs as root (owner's decision 2026-10-18: full access to the server). Apps do NOT inherit
-# this: each app runs as its own `run_as` user (default ubuntu) via a system unit
-# /etc/systemd/system/app-<name>.service with User=, and builds run through `runuser`.
-# Root here means a dashboard login = root on the box: keep it on 127.0.0.1 (SSH tunnel).
+# Template for scripts/install.sh, which replaces the @…@ values and installs the result as
+# /etc/systemd/system/server-manager.service. Re-running the installer rewrites that file, so put
+# your own settings (SM_BASE_PATH, SM_PUBLIC_URL, …) in a drop-in: sudo systemctl edit server-manager
+#
+# Runs as root so it can write systemd units, nginx config and app folders. The apps themselves
+# do not: each runs as its own user (Run as, default @RUN_AS@). A dashboard login is therefore
+# root on this server: keep HOST on 127.0.0.1 and reach it through an SSH tunnel or nginx + HTTPS.
 [Unit]
 Description=Server Manager (deploy, env, PostgreSQL, nginx, usage)
 After=network-online.target postgresql.service nginx.service
@@ -12,20 +14,18 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/home/ubuntu/server-manager
-ExecStart=/home/ubuntu/server-manager/bin/server-manager
-Environment=HOST=127.0.0.1
-Environment=PORT=3900
+WorkingDirectory=@DATA@
+ExecStart=@BIN@
 Environment=HOME=/root
-Environment=SM_DATA_DIR=/home/ubuntu/.server-manager
-Environment=SM_APPS_DIR=/home/ubuntu/apps
-Environment=SM_WEB_DIST=/home/ubuntu/server-manager/web/dist
-Environment=SM_DEFAULT_RUN_AS=ubuntu
-# Public at https://herani.id/server-manager (nginx strips the prefix, Cloudflare in front).
-Environment=SM_BASE_PATH=/server-manager
-Environment=SM_PUBLIC_URL=https://herani.id/server-manager
-Environment=SM_COOKIE_SECURE=1
-Environment=SM_TRUST_PROXY=1
+Environment=HOST=127.0.0.1
+Environment=PORT=@PORT@
+Environment=SM_DATA_DIR=@DATA@
+Environment=SM_APPS_DIR=@APPS@
+Environment=SM_WEB_DIST=@WEB@
+Environment=SM_DEFAULT_RUN_AS=@RUN_AS@
+Environment=SM_BACKUP_DIR=@DATA@/backups/postgres
+Environment=SM_NGINX_DIR=@NGINX_DIR@
+Environment=SM_PUBLIC_IP=@PUBLIC_IP@
 UMask=0077
 Restart=on-failure
 RestartSec=3

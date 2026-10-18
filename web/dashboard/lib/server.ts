@@ -1,9 +1,5 @@
-// The one server this manager runs on (README "Server"). Shown on the sign-in page and in the sidebar.
-export const SERVER = {
-  host: "43.156.104.214",
-  user: "ubuntu",
-  specs: "Ubuntu 24.04 LTS · 2 vCPU · 3.6 GB",
-};
+// The server this manager runs on, as the browser reached it. Shown on the sign-in page and in the sidebar.
+export const SERVER = { host: window.location.hostname };
 
 /** Times in the UI are WIB (server clock is Asia/Shanghai, the API sends unix seconds). */
 export function formatWib(unixSecs: number, opts: Intl.DateTimeFormatOptions = { dateStyle: "medium", timeStyle: "short" }) {

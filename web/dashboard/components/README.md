@@ -127,4 +127,4 @@ Stroke icons `{ size?=18, strokeWidth?=2, className? }`: Plus, Refresh, Filter, 
 - `auth.tsx` — `AuthProvider`, `useAuth()` → `{ user, publicUrl, login, logout }` (`publicUrl` = SM_PUBLIC_URL or the request host + prefix; build webhook links from it).
 - `router.ts` — `useHashRoute()`, `parseRoute(route)` → `{ segments, query }`, `navigate(path)`.
 - `useEventStream.ts` — `useEventStream(url | null)` → `{ lines, done, connected }` for the SSE endpoints built with `src/sse.rs`.
-- `server.ts` — `SERVER` (host / user / specs), `formatWib(unixSecs)`.
+- `server.ts` — `SERVER.host` (the hostname the browser used), `formatWib(unixSecs)` (times in WIB).

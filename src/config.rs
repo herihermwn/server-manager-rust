@@ -16,7 +16,7 @@ pub struct Config {
     /// `SM_BASE_PATH` ("" or "/server-manager"): the prefix nginx strips before proxying here.
     /// Routes don't change; only the cookie path and public URLs carry it.
     pub base_path: String,
-    /// `SM_PUBLIC_URL` (e.g. https://herani.id/server-manager, no trailing slash): shown for webhooks.
+    /// `SM_PUBLIC_URL` (e.g. https://example.com/server-manager, no trailing slash): shown for webhooks.
     pub public_url: Option<String>,
     /// `SM_COOKIE_SECURE=1`: session cookie gets `Secure` (browser is on https, e.g. behind Cloudflare).
     pub cookie_secure: bool,

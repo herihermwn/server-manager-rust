@@ -147,7 +147,7 @@ export function Overview() {
   const subtitle = (
     <>
       <span className="font-mono">
-        {SERVER.user}@{SERVER.host}
+        {SERVER.host}
       </span>
       {c?.os ? ` · ${c.os}` : ""}
       {c?.cores ? ` · ${c.cores} vCPU` : ""}

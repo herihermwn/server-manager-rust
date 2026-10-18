@@ -3,7 +3,8 @@
 #   1. rsync this repo to server-43:~/server-manager-src (no target/, node_modules/, web/dist/)
 #   2. cargo build --release + web build there
 #   3. install bin to ~/server-manager/bin, web/dist to ~/server-manager/web/dist
-#   4. install deploy/server-manager.service as a systemd SYSTEM unit and restart it
+#   4. install deploy/herani/server-manager.service as a systemd SYSTEM unit and restart it
+# Maintainer-only (docs/DEPLOY-herani.md). To install on your own server use scripts/install.sh.
 # Then open it through the tunnel: ssh -L 3900:127.0.0.1:3900 server-43 → http://localhost:3900
 # First time only, on the server: ~/server-manager/bin/server-manager create-admin <username>
 set -euo pipefail
@@ -31,7 +32,7 @@ ssh "$HOST" 'bash -lc "
   mv -f ~/server-manager/bin/server-manager.new ~/server-manager/bin/server-manager
   rsync -a --delete web/dist/ ~/server-manager/web/dist/
 
-  sudo install -m 644 deploy/server-manager.service /etc/systemd/system/server-manager.service
+  sudo install -m 644 deploy/herani/server-manager.service /etc/systemd/system/server-manager.service
   sudo systemctl daemon-reload
   sudo systemctl enable server-manager.service
   sudo systemctl restart server-manager.service

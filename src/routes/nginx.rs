@@ -43,7 +43,6 @@ use std::{
 };
 use tokio::{sync::mpsc, sync::watch};
 
-const DEFAULT_PUBLIC_IP: &str = "43.156.104.214";
 const WEBROOT: &str = "/var/www/html";
 const EXPIRY_WARN_DAYS: i64 = 30;
 
@@ -55,11 +54,18 @@ fn nginx_dir() -> PathBuf {
         .unwrap_or_else(|| "/etc/nginx/sites-manager".into())
 }
 
+/// `SM_PUBLIC_IP`, else the IPv4 this host sends from (UDP connect, no packet leaves). Behind NAT
+/// (most clouds) that is a private address, so set SM_PUBLIC_IP there.
 fn public_ip() -> String {
     std::env::var("SM_PUBLIC_IP")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_PUBLIC_IP.into())
+        .or_else(|| {
+            let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+            s.connect("1.1.1.1:53").ok()?;
+            Some(s.local_addr().ok()?.ip().to_string())
+        })
+        .unwrap_or_else(|| "127.0.0.1".into())
 }
 
 // ======================================================================
