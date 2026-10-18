@@ -264,11 +264,20 @@ async fn run(conn: &mut PgConnection, sql: &str) -> Result<(), String> {
 
 // ---------- backup files ----------
 
-fn backup_dir() -> PathBuf {
-    match std::env::var("SM_BACKUP_DIR") {
-        Ok(d) if !d.trim().is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("backups/postgres"),
+/// `SM_BACKUP_DIR`, else `backups/postgres` next to the default data dir (`~/.server-manager`), so the
+/// folder is the same when the manager runs as root with HOME=/root. Any other data dir: under $HOME.
+fn backup_dir(data_dir: &std::path::Path) -> PathBuf {
+    if let Ok(d) = std::env::var("SM_BACKUP_DIR")
+        && !d.trim().is_empty()
+    {
+        return PathBuf::from(d);
     }
+    let home = match data_dir.file_name().is_some_and(|n| n == ".server-manager") {
+        true => data_dir.parent().map(PathBuf::from),
+        false => None,
+    };
+    home.unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()))
+        .join("backups/postgres")
 }
 
 /// Days since 1970-01-01 → (year, month, day). Howard Hinnant's civil_from_days.
@@ -362,7 +371,7 @@ fn short(s: &str) -> String {
 async fn backup_db(st: &AppState, pg: &Pg, name: &str) -> Result<BackupInfo, String> {
     let _guard = BackupGuard::take(name).ok_or("A backup of this database is already running.")?;
     let at = now();
-    let res = dump(pg, name, at).await;
+    let res = dump(pg, name, at, &backup_dir(&st.cfg.data_dir)).await;
     let (status, size, err) = match &res {
         Ok(b) => ("ok", Some(b.size_bytes), None),
         Err(e) => ("failed", None, Some(short(e))),
@@ -380,8 +389,7 @@ async fn backup_db(st: &AppState, pg: &Pg, name: &str) -> Result<BackupInfo, Str
     res
 }
 
-async fn dump(pg: &Pg, name: &str, at: i64) -> Result<BackupInfo, String> {
-    let dir = backup_dir();
+async fn dump(pg: &Pg, name: &str, at: i64, dir: &std::path::Path) -> Result<BackupInfo, String> {
     private_dir(&dir).map_err(|e| format!("Cannot prepare {}: {e}", dir.display()))?;
     let file = backup_file_name(name, at);
     let (fin, part) = (dir.join(&file), dir.join(format!("{file}.part")));
@@ -510,8 +518,8 @@ async fn db_stats(conn: &mut PgConnection, names: &[String]) -> Result<HashMap<S
     Ok(r.into_iter().map(|(n, s, c)| (n, (s, c))).collect())
 }
 
-fn dir_bytes() -> u64 {
-    std::fs::read_dir(backup_dir())
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
                 .filter(|e| backup_db_of(&e.file_name().to_string_lossy()).is_some())
@@ -523,6 +531,7 @@ fn dir_bytes() -> u64 {
 }
 
 async fn status(State(st): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let dir = backup_dir(&st.cfg.data_dir);
     let list = rows(&st).await?;
     let backup = BackupSummary {
         last_at: list.iter().filter_map(|r| r.last_backup_at).max(),
@@ -536,8 +545,8 @@ async fn status(State(st): State<AppState>) -> ApiResult<impl IntoResponse> {
             .filter(|r| r.last_backup_status.as_deref() == Some("ok"))
             .filter_map(|r| r.last_backup_size)
             .sum(),
-        dir: backup_dir().to_string_lossy().into_owned(),
-        dir_bytes: dir_bytes(),
+        dir: dir.to_string_lossy().into_owned(),
+        dir_bytes: dir_bytes(&dir),
     };
     let mk = |state, error, pg| Status {
         state,
@@ -1209,6 +1218,16 @@ mod tests {
         assert_eq!(mode(&part), 0o600);
         assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn backup_dir_follows_the_data_dir_not_home() {
+        use std::path::Path;
+        // SM_BACKUP_DIR is not set in tests. Running as root (HOME=/root) must still use ubuntu's folder.
+        assert_eq!(
+            backup_dir(Path::new("/home/ubuntu/.server-manager")),
+            Path::new("/home/ubuntu/backups/postgres")
+        );
     }
 
     #[test]
