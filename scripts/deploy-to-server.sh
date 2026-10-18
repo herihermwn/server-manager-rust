@@ -20,6 +20,7 @@ echo "==> build + install on $HOST"
 # bash -l so ~/.cargo/bin and ~/.bun/bin are on PATH.
 ssh "$HOST" 'bash -lc "
   set -euo pipefail
+  export PATH=\$HOME/.cargo/bin:\$HOME/.bun/bin:\$PATH
   cd ~/server-manager-src
   cargo build --release
   (cd web && bun install && bun run build)
