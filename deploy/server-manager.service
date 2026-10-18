@@ -21,6 +21,11 @@ Environment=SM_DATA_DIR=/home/ubuntu/.server-manager
 Environment=SM_APPS_DIR=/home/ubuntu/apps
 Environment=SM_WEB_DIST=/home/ubuntu/server-manager/web/dist
 Environment=SM_DEFAULT_RUN_AS=ubuntu
+# Public at https://herani.id/server-manager (nginx strips the prefix, Cloudflare in front).
+Environment=SM_BASE_PATH=/server-manager
+Environment=SM_PUBLIC_URL=https://herani.id/server-manager
+Environment=SM_COOKIE_SECURE=1
+Environment=SM_TRUST_PROXY=1
 UMask=0077
 Restart=on-failure
 RestartSec=3
