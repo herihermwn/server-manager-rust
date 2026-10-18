@@ -4,6 +4,7 @@ import { SERVER } from "../lib/server";
 import { IconButton } from "./Button";
 import { CountBadge } from "./Badge";
 import { useDialog } from "./Modal";
+import { useApi, type AppSummary } from "./appsApi";
 import {
   AppsIcon,
   BrandTile,
@@ -109,12 +110,13 @@ interface SidebarProps {
 }
 
 /** Dark console navigation. Static column from lg, slide-in drawer below. */
-// ponytail: the Apps attention badge (crashed / failed deploys) is not wired; Phase 3 passes `badge` to its NavLink.
 export function Sidebar({ currentPath, isOpen = false, onClose = () => {} }: SidebarProps) {
   const { user, logout } = useAuth();
   const panel = useRef<HTMLElement>(null);
   useDialog(isOpen, onClose, panel);
   const name = user?.username ?? "owner";
+  // Apps attention badge: crashed apps (systemd gave up after the restart limit).
+  const crashed = (useApi<{ data: AppSummary[] }>("/api/apps", 30_000).data?.data ?? []).filter((a) => a.status === "crashed").length;
 
   return (
     <>
@@ -146,7 +148,7 @@ export function Sidebar({ currentPath, isOpen = false, onClose = () => {} }: Sid
                 <div className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-console-muted">{g.section}</div>
               )}
               {g.items.map((it) => (
-                <NavLink key={it.path} item={it} route={currentPath} onNavigate={onClose} />
+                <NavLink key={it.path} item={it} route={currentPath} onNavigate={onClose} badge={it.path === "/apps" ? crashed : undefined} />
               ))}
             </div>
           ))}

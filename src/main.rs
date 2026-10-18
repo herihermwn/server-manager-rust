@@ -1,15 +1,12 @@
 mod activity;
 mod auth;
 mod config;
-// Building blocks for phases 2-7; drop the allow once a route uses them.
-#[allow(dead_code)]
 mod exec;
 mod http;
 mod routes;
-#[allow(dead_code)]
+#[allow(dead_code)] // sse::run_command is for later phases
 mod sse;
 mod state;
-#[allow(dead_code)]
 mod validate;
 mod web;
 

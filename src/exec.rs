@@ -2,8 +2,9 @@
 //!
 //! - `Cmd::new("git").args([...])`: fixed program + args, no shell, so names/paths can't inject.
 //!   Validate every argument that came from a request first (`validate.rs`).
-//! - `run_shell_user_command(script)`: `bash -lc <script>`. ONLY for the build / before-restart /
-//!   start commands the owner typed into an app form. Never build a script from other input.
+//! - `run_shell_user_command(script, run_as)`: `bash -lc <script>`, as the app's user when the
+//!   manager runs as root. ONLY for the build / before-restart / start commands the owner typed
+//!   into an app form. Never build a script from other input.
 //!
 //! Every child runs in its own process group (killed as a group on timeout or cancel), with stdin
 //! closed and the manager's own `SM_*` env vars removed. Output lines have the given secret values
@@ -63,10 +64,54 @@ pub struct Cmd {
     cancel: Option<Arc<Notify>>,
 }
 
+/// The system user an owner-written command runs as (apps.run_as), resolved from passwd.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunAs {
+    pub user: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: String,
+}
+
+impl RunAs {
+    /// PATH with the per-user toolchains (rustup, bun) first: login shells don't read ~/.bashrc.
+    pub fn path(&self) -> String {
+        let h = &self.home;
+        format!("{h}/.bun/bin:{h}/.cargo/bin:{h}/.local/bin:/usr/local/bin:/usr/bin:/bin")
+    }
+}
+
 /// `nice -n 10 bash -lc <script>` for owner-written build/start commands (rencana §2, §6).
 /// `-l` loads the login profile so rustup/bun/node are on PATH.
-pub fn run_shell_user_command(script: &str) -> Cmd {
-    Cmd::new("nice").args(["-n", "10", "bash", "-lc", script])
+///
+/// When the manager is root and `run_as` is given, the command first drops to that user with
+/// `setpriv --reuid --regid --init-groups` (+ HOME/USER/PATH of that user). setpriv execs in place,
+/// so the child stays in our process group and timeout/cancel still kill the whole build.
+/// (`runuser -u` would start a new session that `killpg` can't reach.)
+pub fn run_shell_user_command(script: &str, run_as: Option<&RunAs>) -> Cmd {
+    // SAFETY: geteuid has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    match run_as {
+        Some(u) if root => Cmd::new("setpriv")
+            .args([
+                format!("--reuid={}", u.uid),
+                format!("--regid={}", u.gid),
+                "--init-groups".into(),
+                "--".into(),
+                "nice".into(),
+                "-n".into(),
+                "10".into(),
+                "bash".into(),
+                "-lc".into(),
+                script.into(),
+            ])
+            .env("HOME", &u.home)
+            .env("USER", &u.user)
+            .env("LOGNAME", &u.user)
+            .env("PATH", u.path()),
+        Some(u) => Cmd::new("nice").args(["-n", "10", "bash", "-lc", script]).env("PATH", u.path()),
+        None => Cmd::new("nice").args(["-n", "10", "bash", "-lc", script]),
+    }
 }
 
 impl Cmd {
@@ -300,7 +345,7 @@ mod tests {
     async fn manager_env_is_not_inherited() {
         // SAFETY: test-only; no other test reads this variable.
         unsafe { std::env::set_var("SM_TEST_SECRET", "x") };
-        let o = run_shell_user_command("echo \"[${SM_TEST_SECRET:-}]\"")
+        let o = run_shell_user_command("echo \"[${SM_TEST_SECRET:-}]\"", None)
             .output()
             .await
             .unwrap();
@@ -311,7 +356,7 @@ mod tests {
     async fn timeout_kills_the_whole_group() {
         let start = std::time::Instant::now();
         // The background sleep keeps stdout open; only a group kill ends it.
-        let o = run_shell_user_command("sleep 30 & sleep 30")
+        let o = run_shell_user_command("sleep 30 & sleep 30", None)
             .timeout(Duration::from_millis(300))
             .output()
             .await

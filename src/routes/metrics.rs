@@ -701,7 +701,7 @@ async fn alerts(State(st): State<AppState>) -> ApiResult<Json<Value>> {
 pub struct Proc {
     pub pid: u32,
     pub name: String,
-    /// App name when this is the main process of the systemd user unit `app-<name>.service`.
+    /// App name when this is the main process of the systemd unit `app-<name>.service`.
     pub app: Option<String>,
     /// Percent of one core, like `top` (can exceed 100).
     pub cpu: f64,
@@ -741,14 +741,8 @@ async fn app_pids() -> HashMap<u32, String> {
     if !cfg!(target_os = "linux") {
         return HashMap::new();
     }
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
     let out = Cmd::new("systemctl")
-        .args(["--user", "show", "app-*.service", "-p", "Id", "-p", "MainPID"])
-        .env(
-            "XDG_RUNTIME_DIR",
-            std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{uid}")),
-        )
+        .args(["show", "app-*.service", "-p", "Id", "-p", "MainPID"])
         .timeout(Duration::from_secs(5))
         .output()
         .await;

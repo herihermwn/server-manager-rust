@@ -516,15 +516,23 @@ struct Target {
     id: i64,
     name: String,
     path: PathBuf,
+    /// apps.run_as: owner of the .env file (the unit reads it as root, the app user may too).
+    run_as: String,
+}
+
+/// write_atomic (mode 600), then hand the file to the app's run_as user when the manager is root.
+async fn write_env(t: &Target, text: &str) -> std::io::Result<()> {
+    write_atomic(&t.path, text)?;
+    super::apps::chown_to(&t.run_as, &t.path).await
 }
 
 async fn target(st: &AppState, name: &str) -> ApiResult<Target> {
     validate::app_name(name)?;
-    let id: Option<i64> = sqlx::query_scalar("SELECT id FROM apps WHERE name = ?")
+    let row: Option<(i64, String)> = sqlx::query_as("SELECT id, run_as FROM apps WHERE name = ?")
         .bind(name)
         .fetch_optional(&st.db)
         .await?;
-    let id = id.ok_or_else(|| AppError::not_found("App not found."))?;
+    let (id, run_as) = row.ok_or_else(|| AppError::not_found("App not found."))?;
     let path = validate::path_under(
         &st.cfg.apps_dir,
         &st.cfg.apps_dir.join(name).join("shared").join(".env"),
@@ -533,6 +541,7 @@ async fn target(st: &AppState, name: &str) -> ApiResult<Target> {
         id,
         name: name.to_owned(),
         path,
+        run_as,
     })
 }
 
@@ -603,7 +612,7 @@ struct RestartOut {
     note: String,
 }
 
-/// `systemctl --user restart app-<name>.service`. Skipped on macOS (no systemd).
+/// `systemctl restart app-<name>.service` (system unit). Skipped on macOS (no systemd).
 async fn restart(name: &str) -> RestartOut {
     if cfg!(target_os = "macos") {
         return RestartOut {
@@ -612,13 +621,9 @@ async fn restart(name: &str) -> RestartOut {
             note: "Restart skipped: systemd is not available on macOS.".into(),
         };
     }
-    let runtime = std::env::var("XDG_RUNTIME_DIR")
-        // SAFETY: getuid has no preconditions.
-        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
     let unit = format!("app-{name}.service");
     let r = Cmd::new("systemctl")
-        .args(["--user", "restart", &unit])
-        .env("XDG_RUNTIME_DIR", runtime)
+        .args(["restart", &unit])
         .timeout(Duration::from_secs(30))
         .output()
         .await;
@@ -736,7 +741,7 @@ async fn save(
     let meta = load_meta(&st, t.id).await?;
     let changes = apply_put(&mut l.file, &body.vars).map_err(AppError::bad_request)?;
     if !changes.is_empty() || l.mtime.is_none() {
-        write_atomic(&t.path, &l.file.serialize())?;
+        write_env(&t, &l.file.serialize()).await?;
     }
     for v in &body.vars {
         let source = if changes.changed.contains(&v.key) {
@@ -885,7 +890,7 @@ async fn import(
         .push(i.key.clone());
     }
     if !changes.is_empty() {
-        write_atomic(&t.path, &l.file.serialize())?;
+        write_env(&t, &l.file.serialize()).await?;
     }
     // A pasted value replaces whatever the key was before, so its source is dropped too.
     for i in items.iter().filter(|i| i.kind != "same") {
@@ -939,7 +944,7 @@ pub async fn upsert_vars(
     for (k, v) in vars {
         l.file.set(k, v);
     }
-    write_atomic(&t.path, &l.file.serialize()).map_err(|e| format!("io: {e}"))?;
+    write_env(&t, &l.file.serialize()).await.map_err(|e| format!("io: {e}"))?;
     for (k, _) in vars {
         save_meta(st, t.id, k, true, source)
             .await
