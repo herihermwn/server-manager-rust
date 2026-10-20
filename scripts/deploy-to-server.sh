@@ -6,7 +6,8 @@
 #   4. install deploy/herani/server-manager.service as a systemd SYSTEM unit and restart it
 # Maintainer-only (docs/DEPLOY-herani.md). To install on your own server use scripts/install.sh.
 # Then open it through the tunnel: ssh -L 3900:127.0.0.1:3900 server-43 → http://localhost:3900
-# First time only, on the server: ~/server-manager/bin/server-manager create-admin <username>
+# First time only, on the server (same SM_DATA_DIR as the unit, or the account lands in ~/.server-manager):
+#   sudo env SM_DATA_DIR=/home/ubuntu/.server-manager ~/server-manager/bin/server-manager create-admin <username>
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
