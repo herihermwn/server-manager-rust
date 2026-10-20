@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, type PointerEvent, type ReactNode } from "react";
 
 export interface ChartCol {
   /** Main value, in the same unit as the chart's `max` (bars; used memory; inbound). */
@@ -56,6 +56,11 @@ export function UsageChart({
   const n = cols.length;
   const h = (v: number) => `${Math.max(0, Math.min(100, (v / (max || 1)) * 100))}%`;
   const hovered = hover !== null ? cols[hover] : undefined;
+  // hover (mouse) or tap (touch) picks the column; touch keeps it until the next tap
+  const pick = (e: PointerEvent<HTMLDivElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    setHover(Math.min(n - 1, Math.max(0, Math.floor(((e.clientX - r.left) / r.width) * n))));
+  };
 
   return (
     <section className="flex flex-col gap-3.5 rounded-xl border border-line bg-surface p-5">
@@ -80,11 +85,9 @@ export function UsageChart({
           role="img"
           aria-label={ariaLabel}
           className="relative h-40 min-w-0 flex-1 border-b border-line-strong"
-          onPointerMove={(e) => {
-            const r = e.currentTarget.getBoundingClientRect();
-            setHover(Math.min(n - 1, Math.max(0, Math.floor(((e.clientX - r.left) / r.width) * n))));
-          }}
-          onPointerLeave={() => setHover(null)}
+          onPointerMove={pick}
+          onPointerDown={pick}
+          onPointerLeave={(e) => e.pointerType === "mouse" && setHover(null)}
         >
           <div className="absolute inset-x-0 top-0 h-px bg-line-soft" aria-hidden="true" />
           <div className="absolute inset-x-0 top-1/2 h-px bg-line-soft" aria-hidden="true" />
