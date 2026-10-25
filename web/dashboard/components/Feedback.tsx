@@ -99,7 +99,7 @@ function BannerIcon({ tone }: { tone: BannerTone }) {
   if (tone === "warning") return <AlertTriangleIcon size={20} strokeWidth={2.25} className="text-warning" />;
   if (tone === "error") return <AlertCircleIcon size={20} strokeWidth={2.25} className="text-danger" />;
   if (tone === "success") return <CheckIcon size={20} strokeWidth={2.25} className="text-success" />;
-  return <span className="mx-1.5 h-2 w-2 shrink-0 rounded-full bg-info" style={{ boxShadow: "0 0 0 4px #CFE0F8" }} aria-hidden="true" />;
+  return <span className="mx-1.5 h-2 w-2 shrink-0 rounded-full bg-info" style={{ boxShadow: "0 0 0 4px rgb(var(--info-ring))" }} aria-hidden="true" />;
 }
 
 /**

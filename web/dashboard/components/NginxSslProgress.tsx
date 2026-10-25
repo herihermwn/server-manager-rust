@@ -76,7 +76,7 @@ export function NginxSslProgress({ siteId, onDone, onDismiss }: { siteId: number
             <li key={s.label} className="flex min-h-10 items-start gap-3">
               <span
                 className={`flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full text-xs font-bold ${
-                  s.state === "done" ? "bg-success text-white" : s.state === "run" ? "bg-info-bg text-info" : s.state === "fail" ? "bg-danger text-white" : "border border-dashed border-line-strong"
+                  s.state === "done" ? "bg-success text-ink-on" : s.state === "run" ? "bg-info-bg text-info" : s.state === "fail" ? "bg-danger text-ink-on" : "border border-dashed border-line-strong"
                 }`}
                 aria-hidden="true"
               >

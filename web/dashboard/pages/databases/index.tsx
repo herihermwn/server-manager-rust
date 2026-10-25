@@ -244,7 +244,7 @@ export function Databases() {
                 label: "PostgreSQL",
                 value: (
                   <span className="flex items-center gap-2">
-                    <span className="h-2 w-2 rounded-full bg-success" style={{ boxShadow: "0 0 0 4px #E5F2EA" }} aria-hidden="true" />
+                    <span className="h-2 w-2 rounded-full bg-success" style={{ boxShadow: "0 0 0 4px rgb(var(--success-bg))" }} aria-hidden="true" />
                     Active
                   </span>
                 ),

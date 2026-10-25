@@ -21,10 +21,10 @@ const RANGES: { value: Range; label: string }[] = [
 ];
 const RANGE_TEXT: Record<Range, string> = { "1h": "last hour", "24h": "last 24 hours", "7d": "last 7 days", "30d": "last 30 days" };
 
-const BLUE = "#1D5FBF";
-const AMBER = "#E9A15C";
-const CACHE = "#B8CFF2";
-const RED = "#B3261E";
+const BLUE = "rgb(var(--info))";
+const AMBER = "rgb(var(--chart-2))";
+const CACHE = "rgb(var(--chart-cache))";
+const RED = "rgb(var(--danger))";
 
 /** Put each point in its slot; slots without a sample stay null (a gap in the chart). */
 function toSlots(s: Series): (Sample | null)[] {
@@ -240,7 +240,7 @@ export function Usage() {
             max={memTotal}
             yLabels={[ax(bytes(memTotal)), ax(bytes(memTotal / 2)), "0"]}
             axis={axis}
-            colorB="bg-[#B8CFF2]"
+            colorB="bg-chart-cache"
             loading={chartsLoading}
             notice={noData}
             ariaLabel={`Memory used and cache over the ${RANGE_TEXT[range]}${s ? `, used ${bytes(s.memUsed)} of ${bytes(s.memTotal)}` : ""}`}

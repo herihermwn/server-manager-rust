@@ -224,7 +224,7 @@ export function AppNew() {
             >
               <span
                 className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full font-mono text-13 font-semibold ${
-                  done ? "bg-success text-white" : cur ? (step === "failed" ? "bg-danger text-white" : "bg-ink text-white") : "bg-muted text-ink-2"
+                  done ? "bg-success text-ink-on" : cur ? (step === "failed" ? "bg-danger text-ink-on" : "bg-ink text-ink-on") : "bg-muted text-ink-2"
                 }`}
               >
                 {done ? "✓" : i + 1}

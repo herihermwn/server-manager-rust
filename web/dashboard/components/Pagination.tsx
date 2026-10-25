@@ -59,7 +59,7 @@ export function Pagination({ page, totalPages, onPageChange, total, pageSize, cl
                 …
               </span>
             ) : p === page ? (
-              <button key={p} type="button" className={`${btn} bg-ink text-white`} aria-current="page" aria-label={`Page ${p}, current`}>
+              <button key={p} type="button" className={`${btn} bg-ink text-ink-on`} aria-current="page" aria-label={`Page ${p}, current`}>
                 {fmt(p)}
               </button>
             ) : (

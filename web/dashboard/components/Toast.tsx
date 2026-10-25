@@ -66,7 +66,7 @@ function Toast({ item, onDismiss }: { item: ToastItem; onDismiss: () => void }) 
       onMouseLeave={() => setPaused(false)}
       onFocus={() => setPaused(true)}
       onBlur={() => setPaused(false)}
-      className="pointer-events-auto flex items-start gap-3 rounded-xl bg-ink py-3.5 pl-4 pr-2 text-paper shadow-toast"
+      className="pointer-events-auto flex items-start gap-3 rounded-xl bg-console py-3.5 pl-4 pr-2 text-console-text shadow-toast"
     >
       <span className="mt-[7px] h-2 w-2 shrink-0 rounded-full" style={{ background: DOT[item.tone ?? "success"] }} aria-hidden="true" />
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">

@@ -62,7 +62,7 @@ export function SegmentedControl<T extends string = string>({ options, value, on
             aria-pressed={sel}
             onClick={() => onChange(o.value)}
             className={`h-[42px] whitespace-nowrap px-4 text-13 focus-visible:outline-offset-[-2px] ${i > 0 ? "border-l border-line-strong" : ""} ${
-              sel ? "bg-ink font-semibold text-white" : "font-medium text-ink hover:bg-paper"
+              sel ? "bg-ink font-semibold text-ink-on" : "font-medium text-ink hover:bg-paper"
             }`}
           >
             {o.label}

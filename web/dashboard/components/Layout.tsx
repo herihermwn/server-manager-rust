@@ -39,7 +39,7 @@ export function Layout({ children, currentPath }: LayoutProps) {
         <button
           type="button"
           onClick={() => main.current?.focus()}
-          className="sr-only z-[70] rounded-lg bg-ink px-4 py-3 text-sm font-semibold text-white focus:not-sr-only focus:fixed focus:left-4 focus:top-4"
+          className="sr-only z-[70] rounded-lg bg-ink px-4 py-3 text-sm font-semibold text-ink-on focus:not-sr-only focus:fixed focus:left-4 focus:top-4"
         >
           Skip to content
         </button>

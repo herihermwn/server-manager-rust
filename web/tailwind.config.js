@@ -1,6 +1,8 @@
 import defaultTheme from "tailwindcss/defaultTheme";
 
 /** Tokens from dashboard-design/Main.dc.html (same system as the Radio API console). No purple. */
+const v = (name) => `rgb(var(--${name}) / <alpha-value>)`;
+
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ["./dashboard/**/*.{html,tsx,ts}"],
@@ -24,51 +26,53 @@ export default {
       // Radii match Tailwind defaults: rounded-md 6 (badge), rounded-lg 8 (control),
       // rounded-xl 12 (card), rounded-2xl 16 (modal).
       boxShadow: {
-        overlay: "0 12px 32px rgba(27, 26, 23, 0.16), 0 0 0 1px rgba(27, 26, 23, 0.08)",
-        modal: "0 24px 64px rgba(27, 26, 23, 0.28)",
-        toast: "0 12px 32px rgba(27, 26, 23, 0.24)",
-        tab: "0 1px 2px rgba(27, 26, 23, 0.12)",
+        overlay: "0 12px 32px rgb(var(--shadow) / 0.16), 0 0 0 1px rgb(var(--shadow-ring) / 0.08)",
+        modal: "0 24px 64px rgb(var(--shadow) / 0.28)",
+        toast: "0 12px 32px rgb(var(--shadow) / 0.24)",
+        tab: "0 1px 2px rgb(var(--shadow) / 0.12)",
       },
+      // Values live in index.css (:root light, [data-theme=dark] dark) as RGB channels so /opacity works.
       colors: {
-        paper: "#F4F3EF", // app ground
-        surface: "#FFFFFF", // cards, inputs
-        sunken: "#F9F8F5", // table header, modal footer
-        muted: "#EEEDE8", // neutral fills: tags, skeleton, tab track
+        paper: v("paper"), // app ground
+        surface: v("surface"), // cards, inputs
+        sunken: v("sunken"), // table header, modal footer
+        muted: v("muted"), // neutral fills: tags, skeleton, tab track
         line: {
-          DEFAULT: "#E3E1DA", // borders, rules
-          strong: "#CFCCC3", // input / secondary button border
-          soft: "#EEEDE8", // table row dividers
+          DEFAULT: v("line"), // borders, rules
+          strong: v("line-strong"), // input / secondary button border
+          soft: v("line-soft"), // table row dividers
         },
         ink: {
-          DEFAULT: "#1B1A17", // text, primary button
-          2: "#47453F", // secondary text
-          3: "#6A675F", // captions, column labels (5.3:1)
-          hover: "#3A3833", // primary button hover
+          DEFAULT: v("ink"), // text, primary button
+          2: v("ink-2"), // secondary text
+          3: v("ink-3"), // captions, column labels (5.3:1)
+          hover: v("ink-hover"), // primary button hover
+          on: v("ink-on"), // text on ink / success / danger fills
         },
-        disabled: { DEFAULT: "#8F8B83", bg: "#EEEDE8" },
+        disabled: { DEFAULT: v("disabled"), bg: v("disabled-bg") },
         console: {
-          DEFAULT: "#1B1A17", // sidebar, terminal ground
-          raised: "#34322D", // active nav item, rules
+          DEFAULT: v("console"), // sidebar, terminal ground
+          raised: v("console-raised"), // active nav item, rules
           text: "#E9E7E1",
           dim: "#C9C6BE",
           muted: "#9C988F",
         },
-        // Terminal line colors (DataDisplay.dc.html log)
+        // Terminal line colors (DataDisplay.dc.html log), always on a dark ground
         term: { cmd: "#9DC0F5", ok: "#8FD3A8", warn: "#F5C27A", err: "#F29B94", live: "#6FA3EE" },
-        brand: { DEFAULT: "#C2372F", soft: "#F0716A" }, // signal only: logo, live, active page, attention count
+        brand: { DEFAULT: v("brand"), soft: "#F0716A" }, // signal only: logo, live, active page, attention count
         info: {
-          DEFAULT: "#1D5FBF", // links, focus, chart 1, deploying
-          bg: "#E6EEFA",
-          hover: "#D5E3F7",
-          strong: "#164A96",
-          ink: "#123E7D",
-          ring: "#CFE0F8",
+          DEFAULT: v("info"), // links, focus, chart 1, deploying
+          bg: v("info-bg"),
+          hover: v("info-hover"),
+          strong: v("info-strong"),
+          ink: v("info-ink"),
+          ring: v("info-ring"),
         },
-        chart: { 1: "#1D5FBF", 2: "#E9A15C" },
-        success: { DEFAULT: "#146C43", bg: "#E5F2EA" },
-        warning: { DEFAULT: "#8A5300", bg: "#FBEFD9", ink: "#5C3700", line: "#D9B77A" },
-        danger: { DEFAULT: "#B3261E", bg: "#FBE8E6", ink: "#7A1A14", hover: "#931E18" },
-        neutral: { DEFAULT: "#47453F", bg: "#EEEDE8" },
+        chart: { 1: v("info"), 2: v("chart-2"), cache: v("chart-cache") },
+        success: { DEFAULT: v("success"), bg: v("success-bg") },
+        warning: { DEFAULT: v("warning"), bg: v("warning-bg"), ink: v("warning-ink"), line: v("warning-line") },
+        danger: { DEFAULT: v("danger"), bg: v("danger-bg"), ink: v("danger-ink"), hover: v("danger-hover") },
+        neutral: { DEFAULT: v("ink-2"), bg: v("muted") },
       },
     },
   },

@@ -75,7 +75,7 @@ export function Modal({ open, onClose, title, description, children, footer, siz
 
   return createPortal(
     <div className="fixed inset-0 z-50 overflow-y-auto">
-      <div className="fixed inset-0 bg-ink/[0.48]" onClick={onClose} aria-hidden="true" />
+      <div className="fixed inset-0 bg-console/[0.48]" onClick={onClose} aria-hidden="true" />
       <div className="flex min-h-full items-center justify-center p-4">
         <div
           ref={panel}
@@ -153,7 +153,7 @@ export function ConfirmDialog({
 
   return createPortal(
     <div className="fixed inset-0 z-50 overflow-y-auto">
-      <div className="fixed inset-0 bg-ink/[0.48]" onClick={busy ? undefined : onClose} aria-hidden="true" />
+      <div className="fixed inset-0 bg-console/[0.48]" onClick={busy ? undefined : onClose} aria-hidden="true" />
       <div className="flex min-h-full items-center justify-center p-4">
         <div
           ref={panel}
@@ -232,7 +232,7 @@ export function Drawer({ open, onClose, title, description, children, footer, wi
 
   return createPortal(
     <div className="fixed inset-0 z-50">
-      <div className="absolute inset-0 bg-ink/[0.48]" onClick={onClose} aria-hidden="true" />
+      <div className="absolute inset-0 bg-console/[0.48]" onClick={onClose} aria-hidden="true" />
       <div
         ref={panel}
         role="dialog"

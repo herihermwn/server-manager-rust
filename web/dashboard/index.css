@@ -3,6 +3,90 @@
 @tailwind utilities;
 
 @layer base {
+  /* Theme tokens as RGB channels (tailwind.config.js reads them). data-theme is set in index.html. */
+  :root {
+    color-scheme: light;
+    --paper: 244 243 239;
+    --surface: 255 255 255;
+    --sunken: 249 248 245;
+    --muted: 238 237 232;
+    --line: 227 225 218;
+    --line-strong: 207 204 195;
+    --line-soft: 238 237 232;
+    --ink: 27 26 23;
+    --ink-2: 71 69 63;
+    --ink-3: 106 103 95;
+    --ink-hover: 58 56 51;
+    --ink-on: 255 255 255;
+    --disabled: 143 139 131;
+    --disabled-bg: 238 237 232;
+    --console: 27 26 23;
+    --console-raised: 52 50 45;
+    --brand: 194 55 47;
+    --info: 29 95 191;
+    --info-bg: 230 238 250;
+    --info-hover: 213 227 247;
+    --info-strong: 22 74 150;
+    --info-ink: 18 62 125;
+    --info-ring: 207 224 248;
+    --chart-2: 233 161 92;
+    --chart-cache: 184 207 242;
+    --success: 20 108 67;
+    --success-bg: 229 242 234;
+    --warning: 138 83 0;
+    --warning-bg: 251 239 217;
+    --warning-ink: 92 55 0;
+    --warning-line: 217 183 122;
+    --danger: 179 38 30;
+    --danger-bg: 251 232 230;
+    --danger-ink: 122 26 20;
+    --danger-hover: 147 30 24;
+    --shadow: 27 26 23;
+    --shadow-ring: 27 26 23;
+  }
+
+  /* Same warm neutrals, inverted. Fills (success, danger, ink) turn light, so text on them is ink-on (dark). */
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --paper: 20 19 17;
+    --surface: 29 28 25;
+    --sunken: 25 24 21;
+    --muted: 42 40 36;
+    --line: 50 48 43;
+    --line-strong: 72 69 63;
+    --line-soft: 38 37 33;
+    --ink: 236 234 228;
+    --ink-2: 194 190 181;
+    --ink-3: 155 151 142;
+    --ink-hover: 214 211 203;
+    --ink-on: 20 19 17;
+    --disabled: 120 116 108;
+    --disabled-bg: 42 40 36;
+    --console: 14 13 12;
+    --console-raised: 44 42 38;
+    --brand: 214 68 60;
+    --info: 122 168 240;
+    --info-bg: 27 42 66;
+    --info-hover: 34 53 84;
+    --info-strong: 165 198 247;
+    --info-ink: 196 216 249;
+    --info-ring: 40 66 108;
+    --chart-2: 233 161 92;
+    --chart-cache: 52 86 140;
+    --success: 102 199 145;
+    --success-bg: 22 48 33;
+    --warning: 240 190 115;
+    --warning-bg: 56 41 17;
+    --warning-ink: 248 214 160;
+    --warning-line: 110 84 38;
+    --danger: 242 139 130;
+    --danger-bg: 62 27 24;
+    --danger-ink: 248 188 182;
+    --danger-hover: 246 166 159;
+    --shadow: 0 0 0;
+    --shadow-ring: 255 255 255;
+  }
+
   body {
     @apply bg-paper text-ink font-sans text-sm;
     -webkit-font-smoothing: antialiased;
@@ -11,14 +95,14 @@
 
   /* One focus ring everywhere: 2px blue, 2px offset. Inputs tighten the offset to 1px. */
   :focus-visible {
-    outline: 2px solid #1D5FBF;
+    outline: 2px solid rgb(var(--info));
     outline-offset: 2px;
   }
 
   /* Subtle scrollbars */
   * {
     scrollbar-width: thin;
-    scrollbar-color: #CFCCC3 transparent;
+    scrollbar-color: rgb(var(--line-strong)) transparent;
   }
   ::-webkit-scrollbar {
     width: 8px;
@@ -28,13 +112,13 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: #CFCCC3;
+    background: rgb(var(--line-strong));
     border-radius: 4px;
     border: 2px solid transparent;
     background-clip: content-box;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background-color: #9C988F;
+    background-color: rgb(var(--ink-3));
   }
 
   /* iOS zooms into inputs under 16px */

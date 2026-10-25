@@ -17,8 +17,8 @@ export interface StepItem {
 }
 
 const DOT: Record<StepState, string> = {
-  done: "bg-success text-white",
-  fail: "bg-danger text-white",
+  done: "bg-success text-ink-on",
+  fail: "bg-danger text-ink-on",
   run: "bg-info-bg text-info",
   wait: "border-[1.5px] border-dashed border-line-strong",
   skip: "border-[1.5px] border-line-strong",

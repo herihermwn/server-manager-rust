@@ -4,11 +4,11 @@ import { CloseIcon } from "./icons";
 export type Tone = "success" | "warning" | "danger" | "info" | "neutral";
 
 const TONE: Record<Tone, { box: string; dot: string; ring: string }> = {
-  success: { box: "bg-success-bg text-success", dot: "bg-success", ring: "#E5F2EA" },
-  warning: { box: "bg-warning-bg text-warning", dot: "bg-warning", ring: "#FBEFD9" },
-  danger: { box: "bg-danger-bg text-danger", dot: "bg-danger", ring: "#FBE8E6" },
-  info: { box: "bg-info-bg text-info", dot: "bg-info", ring: "#E6EEFA" },
-  neutral: { box: "bg-neutral-bg text-neutral", dot: "bg-neutral", ring: "#EEEDE8" },
+  success: { box: "bg-success-bg text-success", dot: "bg-success", ring: "rgb(var(--success-bg))" },
+  warning: { box: "bg-warning-bg text-warning", dot: "bg-warning", ring: "rgb(var(--warning-bg))" },
+  danger: { box: "bg-danger-bg text-danger", dot: "bg-danger", ring: "rgb(var(--danger-bg))" },
+  info: { box: "bg-info-bg text-info", dot: "bg-info", ring: "rgb(var(--info-bg))" },
+  neutral: { box: "bg-neutral-bg text-neutral", dot: "bg-neutral", ring: "rgb(var(--muted))" },
 };
 
 /** Status label: 26px, colored dot + text. Never color alone, always a word. */
@@ -92,7 +92,7 @@ export function Tag({
   const v = {
     muted: "bg-muted text-ink",
     outline: "border border-line-strong text-ink",
-    solid: "bg-ink text-white",
+    solid: "bg-ink text-ink-on",
     plain: "text-ink-3",
   }[variant];
   const isMono = mono ?? (variant === "outline" || variant === "solid");
@@ -126,7 +126,7 @@ export function CountBadge({ count, tone = "ink", label }: { count: number | str
   return (
     <span
       aria-label={label}
-      className={`inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 font-mono text-xs font-semibold text-white ${tone === "brand" ? "bg-brand" : "bg-ink"}`}
+      className={`inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 font-mono text-xs font-semibold ${tone === "brand" ? "bg-brand text-white" : "bg-ink text-ink-on"}`}
     >
       {count}
     </span>

@@ -36,7 +36,7 @@ function EmptyApps() {
       <ol className="m-0 grid w-full max-w-[860px] list-none grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-3 p-0 text-left">
         {STEPS.map((s, i) => (
           <li key={s.title} className="flex flex-col gap-1.5 rounded-xl border border-line bg-sunken p-4">
-            <span className="flex h-[26px] w-[26px] items-center justify-center rounded-full bg-ink font-mono text-13 font-semibold text-white">{i + 1}</span>
+            <span className="flex h-[26px] w-[26px] items-center justify-center rounded-full bg-ink font-mono text-13 font-semibold text-ink-on">{i + 1}</span>
             <span className="text-sm font-semibold">{s.title}</span>
             <span className="text-13 leading-[19px] text-ink-2">{s.body}</span>
           </li>
