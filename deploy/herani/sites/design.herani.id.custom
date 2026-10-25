@@ -1,0 +1,47 @@
+limit_req_status 429;
+access_log /var/log/nginx/design-board.access.log dboard;
+
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header CF-Connecting-IP $remote_addr;
+proxy_set_header X-Forwarded-For $remote_addr;
+proxy_set_header X-Forwarded-Proto https;
+
+# security headers that the app does not set itself; X-Frame-Options / CSP come from the app
+add_header Strict-Transport-Security "max-age=31536000" always;
+add_header X-Content-Type-Options nosniff always;
+
+location /ws/ {
+    proxy_pass http://127.0.0.1:3950;
+    # proxy_set_header here replaces the server-level list, so repeat it
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header CF-Connecting-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_read_timeout 90s;       # app pings every 30 s, drops at 75 s
+    proxy_send_timeout 90s;
+    proxy_buffering off;
+}
+
+location = /api/auth/login {
+    limit_req zone=dboard_login burst=5 nodelay;
+    proxy_pass http://127.0.0.1:3950;
+}
+
+location ~ ^/api/p/[^/]+/push$ {
+    limit_req zone=dboard_push burst=10 nodelay;
+    client_max_body_size 64m;
+    proxy_request_buffering on;   # tar read fully before it is passed on
+    proxy_read_timeout 120s;
+    proxy_pass http://127.0.0.1:3950;
+}
+
+location / {
+    proxy_pass http://127.0.0.1:3950;
+    proxy_read_timeout 60s;
+}
