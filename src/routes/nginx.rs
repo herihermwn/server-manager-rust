@@ -399,10 +399,20 @@ fn proxy_block(d: &Draft, extra: &[&str]) -> Vec<String> {
     v
 }
 
+/// Custom directives with their own `location / { … }` replace the generated one (nginx refuses
+/// two), e.g. for headers that must differ from proxy_block's.
+fn custom_has_root(custom: &str) -> bool {
+    custom.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        w.next() == Some("location") && matches!(w.next(), Some("/" | "/{"))
+    })
+}
+
 /// The lines every content-serving server block shares (below listen/server_name/ssl_*).
 /// `acme`: add the webroot challenge location (the block that listens on port 80).
 fn body(d: &Draft, acme: bool) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
+    let own_root = custom_has_root(&d.custom);
     let section = |v: &mut Vec<String>, lines: Vec<String>| {
         if !v.is_empty() {
             v.push(String::new());
@@ -428,10 +438,12 @@ fn body(d: &Draft, acme: bool) -> Vec<String> {
     }
     match d.kind {
         Kind::Proxy => {
-            let mut l = vec!["    location / {".to_owned()];
-            l.extend(proxy_block(d, &[]));
-            l.push("    }".into());
-            section(&mut v, l);
+            if !own_root {
+                let mut l = vec!["    location / {".to_owned()];
+                l.extend(proxy_block(d, &[]));
+                l.push("    }".into());
+                section(&mut v, l);
+            }
             if d.cache_assets {
                 let mut l = vec!["    location /assets/ {".to_owned()];
                 l.extend(proxy_block(d, &["expires 7d;", "add_header Cache-Control \"public\";"]));
@@ -447,14 +459,16 @@ fn body(d: &Draft, acme: bool) -> Vec<String> {
                     "    index index.html;".into(),
                 ],
             );
-            section(
-                &mut v,
-                vec![
-                    "    location / {".into(),
-                    "        try_files $uri $uri/ =404;".into(),
-                    "    }".into(),
-                ],
-            );
+            if !own_root {
+                section(
+                    &mut v,
+                    vec![
+                        "    location / {".into(),
+                        "        try_files $uri $uri/ =404;".into(),
+                        "    }".into(),
+                    ],
+                );
+            }
             if d.cache_assets {
                 section(
                     &mut v,
@@ -1819,6 +1833,18 @@ server {
 }
 "#;
         assert_eq!(generate(&d, true), want);
+    }
+
+    #[test]
+    fn custom_root_location_replaces_the_generated_one() {
+        let mut d = proxy();
+        d.custom = "location / {\n    proxy_pass http://127.0.0.1:3010;\n    proxy_set_header X-Legacy \"\";\n}".into();
+        let out = generate(&d, false);
+        assert_eq!(out.matches("location / {").count(), 1, "{out}");
+        assert!(out.contains("X-Legacy"));
+        assert!(out.contains("acme-challenge"));
+        assert!(!custom_has_root("location /docs {"));
+        assert!(custom_has_root("  location /{"));
     }
 
     #[test]
