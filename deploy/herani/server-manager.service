@@ -1,4 +1,4 @@
-# The maintainer's own instance (herani.id). Installed by scripts/deploy-to-server.sh to
+# The maintainer's own instance (monitor.herani.id). Installed by scripts/deploy-to-server.sh to
 # /etc/systemd/system/server-manager.service. Everyone else: scripts/install.sh + deploy/server-manager.service.
 # Runs as root (owner's decision 2026-10-18: full access to the server). Apps do NOT inherit
 # this: each app runs as its own `run_as` user (default ubuntu) via a system unit
@@ -22,9 +22,8 @@ Environment=SM_DATA_DIR=/home/ubuntu/.server-manager
 Environment=SM_APPS_DIR=/home/ubuntu/apps
 Environment=SM_WEB_DIST=/home/ubuntu/server-manager/web/dist
 Environment=SM_DEFAULT_RUN_AS=ubuntu
-# Public at https://herani.id/server-manager (nginx strips the prefix, Cloudflare in front).
-Environment=SM_BASE_PATH=/server-manager
-Environment=SM_PUBLIC_URL=https://herani.id/server-manager
+# Public at https://monitor.herani.id (nginx site deploy/herani/monitor.herani.id.conf, Cloudflare in front).
+Environment=SM_PUBLIC_URL=https://monitor.herani.id
 Environment=SM_COOKIE_SECURE=1
 Environment=SM_TRUST_PROXY=1
 # A record target checked before certbot runs (the box is behind NAT).

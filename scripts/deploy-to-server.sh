@@ -37,6 +37,10 @@ ssh "$HOST" 'bash -lc "
   sudo systemctl daemon-reload
   sudo systemctl enable server-manager.service
   sudo systemctl restart server-manager.service
+
+  sudo install -m 644 deploy/herani/monitor.herani.id.conf /etc/nginx/sites-available/monitor.herani.id
+  sudo ln -sf /etc/nginx/sites-available/monitor.herani.id /etc/nginx/sites-enabled/monitor.herani.id
+  sudo nginx -t && sudo systemctl reload nginx
   sleep 2
   systemctl is-active server-manager.service
   curl -fsS -o /dev/null -w \"SPA %{http_code}\n\" http://127.0.0.1:3900/
