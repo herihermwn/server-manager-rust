@@ -50,6 +50,8 @@ export const CheckIcon = icon("M5 12.5l4.5 4.5L19 7");
 export const ExternalIcon = icon("M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5");
 export const MenuIcon = icon("M4 7h16M4 12h16M4 17h16");
 export const LogoutIcon = icon("M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 16l-4-4 4-4M6 12h10");
+export const SunIcon = icon("M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4", <circle cx="12" cy="12" r="4" />);
+export const MoonIcon = icon("M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z");
 export const EditIcon = icon("M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4");
 export const TrashIcon = icon("M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3");
 export const CopyIcon = icon("M9 9h11v11H9zM5 15H4V4h11v1");

@@ -1,4 +1,4 @@
-import { useRef, type ComponentType } from "react";
+import { useRef, useState, type ComponentType } from "react";
 import { useAuth } from "../lib/auth";
 import { SERVER } from "../lib/server";
 import { IconButton } from "./Button";
@@ -11,8 +11,10 @@ import {
   CloseIcon,
   DatabaseIcon,
   LogoutIcon,
+  MoonIcon,
   OverviewIcon,
   SettingsIcon,
+  SunIcon,
   UsageIcon,
   WebServerIcon,
   type IconProps,
@@ -102,6 +104,24 @@ function NavLink({ item, route, badge, onNavigate }: { item: NavItem; route: str
   );
 }
 
+/** Flips data-theme on <html> (first set in index.html) and remembers the choice. */
+function ThemeToggle() {
+  const [dark, setDark] = useState(() => document.documentElement.dataset.theme === "dark");
+  const flip = () => {
+    const next = dark ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try {
+      localStorage.setItem("theme", next);
+    } catch {}
+    setDark(!dark);
+  };
+  return (
+    <IconButton label={dark ? "Switch to light mode" : "Switch to dark mode"} variant="console" onClick={flip}>
+      {dark ? <SunIcon strokeWidth={1.8} /> : <MoonIcon strokeWidth={1.8} />}
+    </IconButton>
+  );
+}
+
 interface SidebarProps {
   currentPath: string;
   /** Mobile drawer state (below lg). Desktop ignores it. */
@@ -120,7 +140,7 @@ export function Sidebar({ currentPath, isOpen = false, onClose = () => {} }: Sid
 
   return (
     <>
-      {isOpen && <div className="fixed inset-0 z-40 bg-ink/[0.48] lg:hidden" onClick={onClose} aria-hidden="true" />}
+      {isOpen && <div className="fixed inset-0 z-40 bg-console/[0.48] lg:hidden" onClick={onClose} aria-hidden="true" />}
       <nav
         ref={panel}
         aria-label="Main"
@@ -164,6 +184,7 @@ export function Sidebar({ currentPath, isOpen = false, onClose = () => {} }: Sid
               <span className="truncate text-sm font-medium">{name}</span>
               <span className="text-xs text-console-muted">Owner</span>
             </span>
+            <ThemeToggle />
             <IconButton label="Log out" variant="console" onClick={logout}>
               <LogoutIcon strokeWidth={1.8} />
             </IconButton>
