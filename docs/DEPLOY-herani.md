@@ -27,10 +27,11 @@ list live in the `herani-landing` repo (`deploy/herani.id.conf`, `deploy/cloudfl
 
 ## Other apps on server-43 (migrated 2026-10-25)
 
-`design-board` (design.herani.id, :3950), `replay` (hindsight.herani.id, :3930) and `shortlink`
-(link.herani.id, :3920) are Server Manager apps: deployed from the dashboard (repos over the HTTPS
-token in Settings), units `app-<name>.service`, running as `ubuntu`, `.env` in
-`~/apps/<name>/shared/.env`, data still in `/var/lib/<name>` (owned by ubuntu).
+`design-board` (design.herani.id, :3950), `replay` (hindsight.herani.id, :3930), `shortlink`
+(link.herani.id, :3920) and `herani-page` (herani.id, :3960) are Server Manager apps: deployed
+from the dashboard (repos over the HTTPS token in Settings), units `app-<name>.service`, running
+as `ubuntu`, `.env` in `~/apps/<name>/shared/.env`, data still in `/var/lib/<name>` (owned by
+ubuntu).
 
 - Hardening from their old units lives in drop-ins `deploy/herani/apps/app-<name>.hardening.conf`,
   installed by hand to `/etc/systemd/system/app-<name>.service.d/hardening.conf` (server-manager
@@ -46,5 +47,8 @@ token in Settings), units `app-<name>.service`, running as `ubuntu`, `.env` in
 - Each repo's own `scripts/deploy-to-server.sh` exits with "Retired". The old units
   (`design-board`, `replay`, `shortlink`.service) are disabled, not deleted; rollback = stop the
   `app-` unit, chown `/var/lib/<name>` back to its user, re-enable the old unit and its nginx site.
-- herani.id (landing) stays outside Server Manager (`/home/ubuntu` is 750, nginx can't read a
-  static site under `~/apps`); its config is in the `herani-landing` repo.
+- herani.id (+ www) is the Server Manager app `herani-page` (Bun, :3960, repo herani-page,
+  database `herani` restored from the old 129.226.159.161 pm2 deploy, uploads on S3). Its site
+  keeps `/stock/<code>` on the shortlink app and 301s `/server-manager/*` to monitor.herani.id
+  (`deploy/herani/sites/herani.id.custom`). The old static landing (`herani-landing` repo,
+  `/var/www/herani.id`) and herani-page's GitHub Actions deploy are no longer used.
