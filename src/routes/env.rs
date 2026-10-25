@@ -987,6 +987,23 @@ pub async fn upsert_vars(
     Ok(())
 }
 
+/// After an app's port changes: `PORT=<old>` in its `.env` (written when the app was created)
+/// becomes `PORT=<new>`. EnvironmentFile= wins over the unit's Environment=PORT, so a stale line
+/// would keep the app on the old port. Any other PORT value is the user's own and stays.
+pub async fn follow_port(st: &AppState, app: &str, old: i64, new: i64) -> Result<bool, String> {
+    let t = target(st, app).await.map_err(msg)?;
+    let _g = WRITE_LOCK.lock().await;
+    let mut l = load(&t.path).map_err(msg)?;
+    if l.file.get("PORT") != Some(old.to_string().as_str()) {
+        return Ok(false);
+    }
+    l.file.set("PORT", &new.to_string());
+    write_env(&t, &l.file.serialize())
+        .await
+        .map_err(|e| format!("io: {e}"))?;
+    Ok(true)
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/apps/{name}/env", get(show).put(save))
@@ -1253,6 +1270,34 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from(".env")]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[tokio::test]
+    async fn follow_port_moves_only_the_old_port() {
+        let d = tmpdir("follow-port");
+        let apps = d.join("apps");
+        std::fs::create_dir_all(apps.join("demo/shared")).unwrap();
+        let env = apps.join("demo/shared/.env");
+        std::fs::write(&env, "# mine\nPORT=3010\nX=1\n").unwrap();
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        sqlx::query("INSERT INTO apps (name, repo_url, path) VALUES ('demo', 'x', ?)")
+            .bind(apps.join("demo").to_str().unwrap())
+            .execute(&db)
+            .await
+            .unwrap();
+        let st = AppState::new(db, Config::test(d.clone(), apps.clone()), vec![0; 32]);
+
+        assert!(follow_port(&st, "demo", 3010, 3020).await.unwrap());
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), "# mine\nPORT=3020\nX=1\n");
+        // PORT the user set to something else stays
+        assert!(!follow_port(&st, "demo", 3010, 3030).await.unwrap());
+        assert!(std::fs::read_to_string(&env).unwrap().contains("PORT=3020\n"));
         std::fs::remove_dir_all(&d).ok();
     }
 

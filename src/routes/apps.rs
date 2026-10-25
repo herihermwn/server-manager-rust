@@ -1349,6 +1349,7 @@ async fn update(
         a.start_cmd = start_cmd(v)?.to_owned();
         changed.push("start");
     }
+    let old_port = a.port;
     if let Some(p) = b.port.filter(|p| Some(*p) != a.port) {
         if let Some(problem) = port_problem(&st, p, Some(a.id)).await? {
             return Err(AppError::bad_request(format!("Port {p}: {problem}")));
@@ -1408,7 +1409,12 @@ async fn update(
     .bind(a.id)
     .execute(&st.db)
     .await?;
-    let unit_note = install_unit(&a).await.err();
+    let mut unit_note = install_unit(&a).await.err();
+    if let (true, Some(old), Some(new)) = (changed.contains(&"port"), old_port, a.port) {
+        if let Err(e) = super::env::follow_port(&st, &a.name, old, new).await {
+            unit_note.get_or_insert(format!("PORT in .env was not updated: {e}"));
+        }
+    }
     activity::log(&st.db, &admin.username, "app.update", &a.name, &changed.join(", ")).await;
     Ok(Json(
         json!({ "data": { "ok": true, "changed": changed, "unitWarning": unit_note } }),
