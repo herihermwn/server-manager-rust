@@ -3,3 +3,6 @@
 /web/dist
 /web/dashboard/styles.css
 .DS_Store
+
+# Local notes for Claude Code (not committed)
+CLAUDE.md
