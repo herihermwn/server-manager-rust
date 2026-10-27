@@ -387,23 +387,34 @@ async fn insert(db: &sqlx::SqlitePool, s: &Sample, extra: &Value, five_min: Opti
 }
 
 /// Average every finished 5 min bucket that has no `metrics_5m` row yet (also catches up after a
-/// restart; the 10 s rows only reach back 24 h), then drop rows past retention.
+/// restart; the 10 s rows only reach back 24 h), then drop rows past retention. Rollup errors
+/// never skip the prune, or `metrics_10s` would grow without bound.
 async fn rollup_and_prune(db: &sqlx::SqlitePool, now: i64) -> Result<(), sqlx::Error> {
     let last = now.div_euclid(BUCKET) * BUCKET - BUCKET;
-    let newest: Option<i64> = sqlx::query_scalar("SELECT MAX(ts) FROM metrics_5m")
+    let newest: Result<Option<i64>, _> = sqlx::query_scalar("SELECT MAX(ts) FROM metrics_5m")
         .fetch_one(db)
-        .await?;
-    let mut b = newest.map_or(now - KEEP_10S, |t| t + BUCKET).max(now - KEEP_10S);
-    b = b.div_euclid(BUCKET) * BUCKET;
-    while b <= last {
-        let rows = rows_between(db, false, b, b + BUCKET).await?;
-        let samples: Vec<Sample> = rows.iter().map(Row::sample).collect();
-        if let (Some(avg), Some(first)) = (average(b, &samples), rows.first()) {
-            let mut extra = first.extra();
-            extra["memCache"] = json!(avg.mem_cache.round());
-            insert(db, &avg, &extra, Some(samples.len() as i64)).await?;
+        .await;
+    if let Ok(newest) = &newest {
+        let mut b = newest.map_or(now - KEEP_10S, |t| t + BUCKET).max(now - KEEP_10S);
+        b = b.div_euclid(BUCKET) * BUCKET;
+        while b <= last {
+            // One bad bucket is logged and skipped; the rest still roll up.
+            let res: Result<(), sqlx::Error> = async {
+                let rows = rows_between(db, false, b, b + BUCKET).await?;
+                let samples: Vec<Sample> = rows.iter().map(Row::sample).collect();
+                if let (Some(avg), Some(first)) = (average(b, &samples), rows.first()) {
+                    let mut extra = first.extra();
+                    extra["memCache"] = json!(avg.mem_cache.round());
+                    insert(db, &avg, &extra, Some(samples.len() as i64)).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = res {
+                eprintln!("[metrics] rollup {b}: {e}");
+            }
+            b += BUCKET;
         }
-        b += BUCKET;
     }
     sqlx::query("DELETE FROM metrics_10s WHERE ts < ?")
         .bind(now - KEEP_10S)
@@ -413,7 +424,7 @@ async fn rollup_and_prune(db: &sqlx::SqlitePool, now: i64) -> Result<(), sqlx::E
         .bind(now - KEEP_5M)
         .execute(db)
         .await?;
-    Ok(())
+    newest.map(|_| ())
 }
 
 async fn sampler(db: sqlx::SqlitePool) {
