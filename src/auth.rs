@@ -199,16 +199,45 @@ pub fn load_or_create_secret(data_dir: &Path) -> std::io::Result<Vec<u8>> {
     Ok(hex.into_bytes())
 }
 
-/// Write a file readable only by the owner (0600).
+/// Write a file readable only by the owner (0600), atomically: temp file in the same folder (mode
+/// 600 from the first byte), fsync, rename over the target. An existing 644 file ends up 600.
 pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt};
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(contents.as_bytes())
+    write_private_group(path, contents, None)
+}
+
+/// `write_private`, and with `gid` (the manager is root) the temp file becomes root:<gid> 0640
+/// through its open handle before the rename, so nothing is ever chowned by path (shared/.env).
+pub fn write_private_group(path: &Path, contents: &str, gid: Option<u32>) -> std::io::Result<()> {
+    use std::{
+        fs::OpenOptions,
+        io::Write,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    let dir = path.parent().ok_or_else(|| std::io::Error::other("no parent folder"))?;
+    std::fs::create_dir_all(dir)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    let r = (|| {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        if let Some(gid) = gid {
+            std::os::unix::fs::fchown(&f, Some(0), Some(gid))?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+        }
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    r
 }
 
 // ---------- passwords ----------
