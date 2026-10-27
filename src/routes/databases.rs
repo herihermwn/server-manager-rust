@@ -114,14 +114,52 @@ fn random_password() -> std::io::Result<String> {
     Ok(out)
 }
 
+/// `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>` (RFC 5802/7677), what PostgreSQL stores.
+/// PostgreSQL SASLpreps the password first; we skip that. Generated passwords are ASCII (unaffected);
+/// a typed non-ASCII password that SASLprep would change (non-NFKC, odd spaces) would not log in.
+fn scram_verifier(password: &str, salt: &[u8]) -> String {
+    use hmac::{KeyInit, Mac};
+    use sha2::{Digest, Sha256};
+    type H = hmac::Hmac<Sha256>;
+    let mac = |key: &[u8], msg: &[u8]| -> [u8; 32] {
+        let mut m = H::new_from_slice(key).expect("HMAC takes any key length");
+        m.update(msg);
+        m.finalize().into_bytes().into()
+    };
+    // PBKDF2-HMAC-SHA256, one 32-byte block.
+    let mut u = mac(password.as_bytes(), &[salt, &1u32.to_be_bytes()].concat());
+    let mut salted = u;
+    for _ in 1..4096 {
+        u = mac(password.as_bytes(), &u);
+        salted.iter_mut().zip(u).for_each(|(s, x)| *s ^= x);
+    }
+    let stored = Sha256::digest(mac(&salted, b"Client Key"));
+    let server = mac(&salted, b"Server Key");
+    format!("SCRAM-SHA-256$4096:{}${}:{}", b64(salt), b64(&stored), b64(&server))
+}
+
+/// Standard base64 with padding.
+fn b64(data: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let n = u32::from(c[0]) << 16 | u32::from(*c.get(1).unwrap_or(&0)) << 8 | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
 // ---------- the SQL we run (pure, so tests can read it) ----------
 
 fn sql_create_role(owner: &str) -> String {
     format!("CREATE ROLE {} LOGIN", qi(owner))
 }
 /// Separate from CREATE ROLE so a failing CREATE ROLE never carries the password into the server log.
-fn sql_set_password(owner: &str, password: &str) -> String {
-    format!("ALTER ROLE {} PASSWORD {}", qi(owner), ql(password))
+/// Sends a SCRAM verifier, not the plaintext, so a logged ALTER ROLE leaks nothing usable.
+fn sql_set_password(owner: &str, password: &str, salt: &[u8; 16]) -> String {
+    format!("ALTER ROLE {} PASSWORD {}", qi(owner), ql(&scram_verifier(password, salt)))
 }
 /// The admin must be able to act as the owner (CREATE/DROP DATABASE, pg_dump, trusted extensions).
 fn sql_grant_owner(owner: &str, admin: &str, pg16: bool) -> String {
@@ -376,7 +414,7 @@ async fn backup_db(st: &AppState, pg: &Pg, name: &str) -> Result<BackupInfo, Str
         Ok(b) => ("ok", Some(b.size_bytes), None),
         Err(e) => ("failed", None, Some(short(e))),
     };
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE databases SET last_backup_at = ?, last_backup_status = ?, last_backup_size = ?, last_backup_error = ? WHERE name = ?",
     )
     .bind(at)
@@ -385,7 +423,10 @@ async fn backup_db(st: &AppState, pg: &Pg, name: &str) -> Result<BackupInfo, Str
     .bind(err)
     .bind(name)
     .execute(&st.db)
-    .await;
+    .await
+    {
+        eprintln!("[databases] backup status {name}: {e}");
+    }
     res
 }
 
@@ -786,7 +827,10 @@ async fn create(
         .map_err(|e| fail("Creating the user", e))?;
     let mut made_db = false;
     let steps: Result<(), (&str, String)> = async {
-        run(&mut conn, &sql_set_password(&req.owner, &password))
+        use argon2::password_hash::rand_core::{OsRng, RngCore};
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        run(&mut conn, &sql_set_password(&req.owner, &password, &salt))
             .await
             .map_err(|e| ("Setting the password", e))?;
         run(&mut conn, &sql_grant_owner(&req.owner, &admin_user, pg16))
@@ -826,13 +870,19 @@ async fn create(
         }
     }
 
-    sqlx::query("INSERT INTO databases (name, owner, app_id, extensions) VALUES (?, ?, ?, ?)")
+    let insert = sqlx::query("INSERT INTO databases (name, owner, app_id, extensions) VALUES (?, ?, ?, ?)")
         .bind(&req.name)
         .bind(&req.owner)
         .bind(app.as_ref().map(|a| a.1))
         .bind(serde_json::to_string(&installed).unwrap_or_else(|_| "[]".into()))
         .execute(&st.db)
-        .await?;
+        .await;
+    if let Err(e) = insert {
+        // Unrecorded, the database could never be retried or dropped from here.
+        let _ = run(&mut conn, &sql_drop_db(&req.name)).await;
+        let _ = run(&mut conn, &sql_drop_role(&req.owner)).await;
+        return Err(e.into());
+    }
 
     let url = pg.url(&req.owner, Some(&password), &req.name);
     let mut linked_app = None;
@@ -1045,10 +1095,21 @@ mod tests {
         assert_eq!(ql("it's"), "E'it''s'");
         assert_eq!(ql(r"back\slash"), r"E'back\\slash'");
         assert_eq!(ql(r"a\'; DROP DATABASE x; --"), r"E'a\\''; DROP DATABASE x; --'");
+        let set = sql_set_password("u", r#"p'w\"1"#, &[0; 16]);
+        assert!(set.starts_with(r#"ALTER ROLE "u" PASSWORD E'SCRAM-SHA-256$4096:AAAAAAAAAAAAAAAAAAAAAA==$"#), "{set}");
+        assert!(!set.contains("p''w"), "{set}");
+    }
+
+    #[test]
+    fn scram_matches_postgres_format() {
+        // python3: hashlib.pbkdf2_hmac('sha256', pw, bytes(range(16)), 4096, 32) + hmac + base64
+        let salt: Vec<u8> = (0..16).collect();
         assert_eq!(
-            sql_set_password("u", r#"p'w\"1"#),
-            r#"ALTER ROLE "u" PASSWORD E'p''w\\"1'"#
+            scram_verifier("correct horse battery staple", &salt),
+            "SCRAM-SHA-256$4096:AAECAwQFBgcICQoLDA0ODw==$ONYbSJBXtKl6bP6PVqw8pm9e7EiacprLnoUQPFS80Hw=:IPOtHuGJ2HifEQg74W2XXqqCrCyQG55GbPRHa6g6n9w="
         );
+        let b: Vec<String> = ["", "f", "fo", "foo", "foob", "fooba", "foobar"].iter().map(|s| b64(s.as_bytes())).collect();
+        assert_eq!(b, ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"]);
     }
 
     #[test]
