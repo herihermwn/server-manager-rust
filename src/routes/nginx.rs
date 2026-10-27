@@ -41,7 +41,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{sync::mpsc, sync::watch};
+use tokio::{sync::MutexGuard, sync::mpsc, sync::watch};
 
 const WEBROOT: &str = "/var/www/html";
 const EXPIRY_WARN_DAYS: i64 = 30;
@@ -99,26 +99,25 @@ pub fn hostname(s: &str) -> Result<String, AppError> {
 }
 
 /// True when every `{` has its `}` and nothing closes the surrounding `server { }`.
-/// Follows nginx's own tokenizer: `#` comments and quotes only start at the beginning of a token,
-/// `\` escapes the next character, and `${name}` is a variable, not a block.
+/// Follows nginx's own tokenizer (`ngx_conf_read_token`): `#` comments, quotes and `}` only count at the
+/// start of a token, `\` escapes the next character, and a `{` right after `$` is part of the word.
 pub fn braces_balanced(s: &str) -> bool {
     let (mut depth, mut quote, mut comment) = (0i32, None::<char>, false);
     let mut start = true; // at the start of a token
-    let mut chars = s.chars().peekable();
-    let mut prev = ' ';
+    let mut var = false; // after `$` (or `${`): nginx reads a `{` here as part of the word
+    let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if comment {
             if c == '\n' {
                 comment = false;
                 start = true;
             }
-            prev = c;
             continue;
         }
         if c == '\\' {
             chars.next();
             start = false;
-            prev = c;
+            var = false;
             continue;
         }
         if let Some(q) = quote {
@@ -126,27 +125,18 @@ pub fn braces_balanced(s: &str) -> bool {
                 quote = None;
                 start = false;
             }
-            prev = c;
             continue;
         }
         match c {
             '#' if start => comment = true,
             '\'' | '"' if start => quote = Some(c),
-            '{' if prev == '$' => {
-                // ${var}: skip to its closing brace, it is part of the token.
-                loop {
-                    match chars.next() {
-                        Some('}') => break,
-                        Some(_) => {}
-                        None => return false,
-                    }
-                }
-                start = false;
-            }
+            '{' if var => {}
             '{' => {
                 depth += 1;
                 start = true;
             }
+            // Inside a word (`${y}`, `a}`) nginx keeps `}` as a plain character.
+            '}' if !start => {}
             '}' => {
                 depth -= 1;
                 if depth < 0 {
@@ -154,11 +144,11 @@ pub fn braces_balanced(s: &str) -> bool {
                 }
                 start = true;
             }
-            ';' => start = true,
-            c if c.is_whitespace() => start = true,
+            // nginx's whitespace only: a vertical tab or NBSP is a word character to it.
+            ';' | ' ' | '\t' | '\r' | '\n' => start = true,
             _ => start = false,
         }
-        prev = c;
+        var = c == '$' || (var && c == '{');
     }
     depth == 0 && quote.is_none()
 }
@@ -628,7 +618,8 @@ struct TestRecord {
 }
 static LAST_TEST: Mutex<Option<TestRecord>> = Mutex::new(None);
 
-/// One change at a time: files and `nginx -t` are shared state.
+/// One change at a time: files, `nginx -t` and the sites rows are shared state. Handlers hold it over
+/// the whole read-modify-write (load, apply, DB write); `apply` takes the guard to prove it.
 static APPLY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn sudo(args: &[&str]) -> Cmd {
@@ -700,29 +691,34 @@ fn conf_file(dir: &Path, domain: &str, enabled: bool) -> PathBuf {
 
 /// Remove the files of `remove`, write `write = (domain, enabled, content)`, and when anything live
 /// changed run `check` (nginx -t + reload). If `check` fails every touched file is put back as it was.
+/// The caller holds `APPLY_LOCK`.
 async fn apply_with(
     dir: &Path,
     remove: &[&str],
     write: Option<(&str, bool, &str)>,
     check: impl AsyncFn() -> Result<(), ApplyError>,
 ) -> Result<(), ApplyError> {
-    let _g = APPLY_LOCK.lock().await;
     let mut domains: Vec<&str> = remove.to_vec();
     if let Some((d, ..)) = write {
         domains.push(d);
     }
-    let mut snap: Vec<(PathBuf, Option<String>)> = Vec::new();
+    let mut snap: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     for d in &domains {
         for en in [true, false] {
             let p = conf_file(dir, d, en);
-            let old = std::fs::read_to_string(&p).ok();
+            // Only a missing file is "nothing to restore"; any other read error stops before a change.
+            let old = match std::fs::read(&p) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
             snap.push((p, old));
         }
     }
     let was_live = snap
         .iter()
         .any(|(p, old)| old.is_some() && p.extension().is_some_and(|e| e == "conf"));
-    let restore = |snap: &[(PathBuf, Option<String>)]| {
+    let restore = |snap: &[(PathBuf, Option<Vec<u8>>)]| {
         for (p, old) in snap {
             match old {
                 Some(c) => {
@@ -771,7 +767,11 @@ async fn apply_with(
     Ok(())
 }
 
-async fn apply(remove: &[&str], write: Option<(&str, bool, &str)>) -> Result<(), ApplyError> {
+async fn apply(
+    _g: &MutexGuard<'_, ()>,
+    remove: &[&str],
+    write: Option<(&str, bool, &str)>,
+) -> Result<(), ApplyError> {
     apply_with(&nginx_dir(), remove, write, test_and_reload).await
 }
 
@@ -1248,11 +1248,13 @@ async fn web_read_warning(st: &AppState, d: &Draft) -> Option<String> {
 
 async fn create(State(st): State<AppState>, Extension(a): Extension<Admin>, Json(input): Json<Input>) -> ApiResult {
     let d = Draft::build(&input, &st.cfg.apps_dir, app_port(&st, input.app_id).await?)?;
+    let g = APPLY_LOCK.lock().await;
     taken(&st, &d.domain, None).await?;
-    if let Err(e) = apply(&[], Some((&d.domain, true, &generate(&d, false)))).await {
+    if let Err(e) = apply(&g, &[], Some((&d.domain, true, &generate(&d, false)))).await {
         return Ok(apply_error(e, &d.domain));
     }
     let id = insert_or_update(&st, None, &d, true, None).await?;
+    drop(g);
     let warning = web_read_warning(&st, &d).await;
     activity::log(
         &st.db,
@@ -1314,6 +1316,7 @@ async fn update(
     UrlPath(id): UrlPath<i64>,
     Json(input): Json<Input>,
 ) -> ApiResult {
+    let g = APPLY_LOCK.lock().await;
     let old = load(&st, id).await?;
     let d = Draft::build(&input, &st.cfg.apps_dir, app_port(&st, input.app_id).await?)?;
     taken(&st, &d.domain, Some(id)).await?;
@@ -1326,10 +1329,11 @@ async fn update(
     let ssl_active = d.ssl && expires.is_some();
     let rename = old.domain != d.domain;
     let remove: Vec<&str> = if rename { vec![&old.domain] } else { vec![] };
-    if let Err(e) = apply(&remove, Some((&d.domain, old.enabled, &generate(&d, ssl_active)))).await {
+    if let Err(e) = apply(&g, &remove, Some((&d.domain, old.enabled, &generate(&d, ssl_active)))).await {
         return Ok(apply_error(e, &d.domain));
     }
     insert_or_update(&st, Some(id), &d, old.enabled, expires).await?;
+    drop(g);
     let warning = web_read_warning(&st, &d).await;
     activity::log(
         &st.db,
@@ -1355,14 +1359,16 @@ async fn remove(
     UrlPath(id): UrlPath<i64>,
     Query(q): Query<DeleteQuery>,
 ) -> ApiResult {
+    let g = APPLY_LOCK.lock().await;
     let r = load(&st, id).await?;
-    if let Err(e) = apply(&[&r.domain], None).await {
+    if let Err(e) = apply(&g, &[&r.domain], None).await {
         return Ok(apply_error(e, &r.domain));
     }
     sqlx::query("DELETE FROM sites WHERE id = ?")
         .bind(id)
         .execute(&st.db)
         .await?;
+    drop(g);
     let mut cert_error = None;
     if q.delete_cert && r.cert_ready() {
         let o = sudo(&[
@@ -1394,13 +1400,22 @@ async fn remove(
 }
 
 async fn set_enabled(st: &AppState, a: &Admin, id: i64, enabled: bool) -> ApiResult {
+    let g = APPLY_LOCK.lock().await;
     let r = load(st, id).await?;
     if r.enabled == enabled {
         return Ok(Json(json!({ "site": r.json() })).into_response());
     }
-    let d = r.draft(st)?;
-    let content = generate(&d, d.ssl && r.cert_ready());
-    if let Err(e) = apply(&[], Some((&r.domain, enabled, &content))).await {
+    // Move the file as it is: regenerating needs the app, which may have been deleted.
+    // Only a missing file is rebuilt from the row.
+    let content = match std::fs::read_to_string(conf_file(&nginx_dir(), &r.domain, r.enabled)) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let d = r.draft(st)?;
+            generate(&d, d.ssl && r.cert_ready())
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if let Err(e) = apply(&g, &[], Some((&r.domain, enabled, &content))).await {
         return Ok(apply_error(e, &r.domain));
     }
     sqlx::query("UPDATE sites SET enabled = ?, updated_at = unixepoch() WHERE id = ?")
@@ -1408,6 +1423,7 @@ async fn set_enabled(st: &AppState, a: &Admin, id: i64, enabled: bool) -> ApiRes
         .bind(id)
         .execute(&st.db)
         .await?;
+    drop(g);
     activity::log(
         &st.db,
         &a.username,
@@ -1470,7 +1486,11 @@ async fn status(State(st): State<AppState>) -> ApiResult<impl IntoResponse> {
 }
 
 async fn test(Extension(a): Extension<Admin>, State(st): State<AppState>) -> ApiResult<impl IntoResponse> {
-    let t = nginx_test().await;
+    // Never test a half-applied change.
+    let t = {
+        let _g = APPLY_LOCK.lock().await;
+        nginx_test().await
+    };
     activity::log(
         &st.db,
         &a.username,
@@ -1581,7 +1601,7 @@ async fn ssl_start(
     Ok((StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response())
 }
 
-async fn run_ssl(st: &AppState, job: &Job, site: &Row, mut d: Draft, force: bool) -> Result<(), String> {
+async fn run_ssl(st: &AppState, job: &Job, site: &Row, d: Draft, force: bool) -> Result<(), String> {
     let email = d.ssl_email.clone().unwrap_or_default();
     let names: Vec<&str> = std::iter::once(d.domain.as_str())
         .chain(d.aliases.iter().map(String::as_str))
@@ -1675,14 +1695,19 @@ async fn run_ssl(st: &AppState, job: &Job, site: &Row, mut d: Draft, force: bool
         job.step(2, "fail", "");
         return Err("certbot succeeded but the certificate is not listed. Check `certbot certificates`.".into());
     };
-    sqlx::query("UPDATE sites SET ssl = 1, ssl_expires_at = ?, updated_at = unixepoch() WHERE id = ?")
-        .bind(cert.expires_at)
-        .bind(site.id)
-        .execute(&st.db)
-        .await
-        .map_err(|e| e.to_string())?;
+    // certbot can take minutes: build from the row as it is now, so edits made meanwhile are kept.
+    let g = APPLY_LOCK.lock().await;
+    let text = |e: AppError| match e {
+        AppError::Status(_, m) | AppError::Internal(m) => m,
+    };
+    let site = load(st, site.id).await.map_err(text)?;
+    let mut d = site.draft(st).map_err(text)?;
+    if d.domain != cert.name {
+        job.step(2, "fail", "");
+        return Err("The site was renamed while the certificate was issued. The config was not changed.".into());
+    }
     d.ssl = true;
-    if let Err(e) = apply(&[], Some((&d.domain, site.enabled, &generate(&d, true)))).await {
+    if let Err(e) = apply(&g, &[], Some((&d.domain, site.enabled, &generate(&d, true)))).await {
         job.step(2, "fail", "");
         let msg = match e {
             ApplyError::Test(t) => {
@@ -1697,6 +1722,14 @@ async fn run_ssl(st: &AppState, job: &Job, site: &Row, mut d: Draft, force: bool
         };
         return Err(msg);
     }
+    // Only now: a config nginx rejected must not leave ssl = 1 behind.
+    sqlx::query("UPDATE sites SET ssl = 1, ssl_expires_at = ?, updated_at = unixepoch() WHERE id = ?")
+        .bind(cert.expires_at)
+        .bind(site.id)
+        .execute(&st.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    drop(g);
     job.step(2, "done", "nginx -t && systemctl reload nginx");
     activity::log(
         &st.db,
@@ -2086,6 +2119,9 @@ server {
             "add_header X '{';",
             "set $x ${y};",
             "return 200 \"a \\\" }\";",
+            // nginx ends the word `${y` at `;` (nginx -t then rejects the variable), no block opens or closes.
+            "set $x ${y;",
+            "add_header X a};",
         ] {
             assert!(braces_balanced(ok), "{ok:?}");
         }
@@ -2096,8 +2132,14 @@ server {
             "return 200 \"x;",
             "} server { listen 1;",
             "add_header X a#b; }",
-            "set $x ${y;",
             "a } # {",
+            // `${` is part of the word, but `;` still ends it, so these `}` close server { }.
+            "default_type ${;}",
+            "upstream u${ { # }\n",
+            "set $x ${{;}",
+            // A vertical tab or NBSP is not whitespace to nginx: `#` here is not a comment.
+            "default_type a\u{b}#;}",
+            "default_type a\u{a0}#;}",
         ] {
             assert!(!braces_balanced(bad), "{bad:?}");
         }
@@ -2214,6 +2256,42 @@ server {
             .await
             .unwrap();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_keeps_bytes_and_stops_on_read_errors() {
+        let dir = std::env::temp_dir().join(format!("sm-nginx-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fail = async || Err(ApplyError::Reload("boom".into()));
+        // Callers hold the lock; apply_with must not take it again (tokio's Mutex is not reentrant).
+        let g = APPLY_LOCK.lock().await;
+
+        // Non-UTF-8 content is restored byte for byte, not dropped as "no file".
+        let live = dir.join("a.example.com.conf");
+        std::fs::write(&live, b"v1 \xff").unwrap();
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            apply_with(&dir, &[], Some(("a.example.com", true, "v2")), fail),
+        )
+        .await
+        .expect("apply_with waited for APPLY_LOCK");
+        assert!(matches!(r, Err(ApplyError::Reload(_))));
+        assert_eq!(std::fs::read(&live).unwrap(), b"v1 \xff");
+
+        // A file that cannot be read stops before anything is touched (it used to count as missing,
+        // so a failed check deleted it). Root reads it anyway, so the case only runs as a normal user.
+        use std::os::unix::fs::PermissionsExt;
+        let b = dir.join("b.example.com.conf");
+        std::fs::write(&b, "v1").unwrap();
+        std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&b).is_err() {
+            let r = apply_with(&dir, &[], Some(("b.example.com", true, "v2")), fail).await;
+            assert!(matches!(r, Err(ApplyError::Io(_))), "{r:?}");
+            std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(std::fs::read_to_string(&b).unwrap(), "v1");
+        }
+        drop(g);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
