@@ -114,7 +114,7 @@ pub fn safe_app_env(vars: &[(String, String)]) -> (Vec<(String, String)>, Vec<St
 /// `-l` loads the login profile so rustup/bun/node are on PATH.
 ///
 /// With `run_as`, the command is `[setpriv --reuid --regid --init-groups --] /usr/bin/env -i
-/// KEY=VAL… HOME= USER= LOGNAME= PATH= nice -n 10 bash -lc <script>`:
+/// KEY=VAL… HOME= USER= LOGNAME= PATH= GIT_CONFIG_*= nice -n 10 bash -lc <script>`:
 /// - the wrapper process starts from an EMPTY environment, so root never sees an app variable
 ///   (LD_PRELOAD & co. in shared/.env can't run code before the privilege drop);
 /// - app variables are separate argv elements of `env -i`, applied after setpriv dropped to the
@@ -149,6 +149,10 @@ fn shell_cmd(script: &str, run_as: Option<&RunAs>, app_env: &[(String, String)],
         format!("USER={}", u.user),
         format!("LOGNAME={}", u.user),
         format!("PATH={}", u.path()),
+        // A release's gitdir is in repo/, which is root's: let git in a build trust it.
+        "GIT_CONFIG_COUNT=1".into(),
+        "GIT_CONFIG_KEY_0=safe.directory".into(),
+        "GIT_CONFIG_VALUE_0=*".into(),
     ]);
     argv.extend(["nice", "-n", "10", "bash", "-lc", script].map(String::from));
     let program = if root { "/usr/bin/setpriv" } else { "/usr/bin/env" };
@@ -497,6 +501,14 @@ mod tests {
             assert!(forbidden_env_key(k), "{k}");
         }
         assert!(!forbidden_env_key("DATABASE_URL") && !forbidden_env_key("ENVIRONMENT"));
+        // git trusts the root-owned repo/, and .env can't change that (env -i: the last one wins).
+        let mut vars = app_env();
+        vars.push(("GIT_CONFIG_COUNT".into(), "5".into()));
+        let c = shell_cmd("echo hi", Some(&me()), &vars, true);
+        let at = |s: &str| c.args.iter().rposition(|a| a == s).unwrap();
+        assert!(at("GIT_CONFIG_COUNT=5") < at("GIT_CONFIG_COUNT=1"));
+        assert!(at("GIT_CONFIG_COUNT=1") < at("GIT_CONFIG_KEY_0=safe.directory"));
+        assert!(at("GIT_CONFIG_KEY_0=safe.directory") < at("GIT_CONFIG_VALUE_0=*") && at("GIT_CONFIG_VALUE_0=*") < at("nice"));
     }
 
     #[tokio::test]
