@@ -12,7 +12,7 @@
 use super::deploys;
 use crate::{
     activity,
-    auth::{Admin, write_private},
+    auth::{Admin, write_private_group},
     exec::{Cmd, Exit, Line, RunAs},
     http::{ApiResult, AppError, now},
     sse,
@@ -231,7 +231,7 @@ async fn suggest_port(st: &AppState) -> Result<i64, AppError> {
 
 // ---------- commands ----------
 
-fn is_root() -> bool {
+pub fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() == 0 }
 }
@@ -306,15 +306,60 @@ pub async fn chown_r(user: &RunAs, path: &FsPath) -> Result<(), String> {
     }
 }
 
-/// chown one file (e.g. shared/.env) to the app user, keeping its mode. No-op when not root.
-pub async fn chown_to(run_as: &str, path: &FsPath) -> std::io::Result<()> {
+/// Root runs git, rename and remove inside the app folder, so the app user must not own what root
+/// walks through: `<app>/`, `releases/` and `shared/` become root:<gid> 0750 (the app user can
+/// still traverse to `current`), `repo/` root:<gid> recursively (group read: builds run git in
+/// their worktree, whose gitdir is in repo/), `shared/.env` root:<gid> 0640. `releases/<n>` and
+/// the data in shared/ stay the app user's. Idempotent, never follows a symlink, no-op when not root.
+pub async fn secure_layout(dir: &FsPath, user: &RunAs) -> Result<(), String> {
+    use std::os::unix::fs::{PermissionsExt, lchown};
     if !is_root() {
         return Ok(());
     }
-    let u = lookup_user(run_as)
-        .await
-        .map_err(|_| std::io::Error::other(format!("no system user {run_as}")))?;
-    std::os::unix::fs::chown(path, Some(u.uid), Some(u.gid))
+    let set = |p: &FsPath, mode: u32| -> std::io::Result<()> {
+        lchown(p, Some(0), Some(user.gid))?;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
+    };
+    // <app> first: once it is root's, the app user can't swap repo/, releases/ or shared/.
+    let mut dirs = Vec::new();
+    for (i, d) in [dir.to_path_buf(), dir.join("repo"), dir.join("releases"), dir.join("shared")]
+        .into_iter()
+        .enumerate()
+    {
+        match d.symlink_metadata() {
+            Ok(m) if m.is_dir() => set(&d, 0o750).map_err(|e| format!("{}: {e}", d.display()))?,
+            Ok(_) => return Err(format!("{} is a symlink or not a folder", d.display())),
+            // Only the app folder itself must exist.
+            Err(e) if i > 0 && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{}: {e}", d.display())),
+        }
+        dirs.push(d.to_string_lossy().into_owned());
+    }
+    // Where nginx::grant_web_read set an ACL (<app>, releases/), chmod only moves the mask and the
+    // owning group's entry stays ---. No setfacl or no ACL support means no such ACL: ignored.
+    let _ = Cmd::new("setfacl").args(["-m", "g::rx", "--"]).args(dirs).output().await;
+    let repo = dir.join("repo");
+    if repo.is_dir() {
+        // -R without -H/-L: symlinks inside are not followed.
+        let owner = format!("0:{}", user.gid);
+        for args in [["chown", "-R", owner.as_str()], ["chmod", "-R", "g+rX,g-w,o-rwx"]] {
+            let o = Cmd::new(args[0])
+                .args(args[1..].iter().copied())
+                .arg(repo.to_string_lossy())
+                .timeout(Duration::from_secs(300))
+                .output()
+                .await
+                .map_err(|e| format!("{}: {e}", args[0]))?;
+            if !o.exit.success() {
+                return Err(format!("{} {}: {}", args[0], repo.display(), o.stderr.trim()));
+            }
+        }
+    }
+    let env = dir.join("shared").join(".env");
+    if env.symlink_metadata().is_ok_and(|m| m.is_file()) {
+        set(&env, 0o640).map_err(|e| format!("{}: {e}", env.display()))?;
+    }
+    Ok(())
 }
 
 /// `systemctl <args>` (system manager). Ok(stdout) on exit 0, Err(stderr) otherwise.
@@ -437,9 +482,10 @@ pub async fn restart_app(name: &str) -> Result<(), String> {
     systemctl(&["restart", &unit]).await.map(|_| ())
 }
 
-/// git (as the manager, i.e. root) with the server deploy key, no prompts. Its global config is
-/// `<data>/gitconfig` with `safe.directory=*`, because app folders (and local source repos) belong
-/// to other users; `-c` would not reach the upload-pack of a local clone. Known hosts: data dir.
+/// git (as the manager, i.e. root) with the server deploy key, no prompts. Hooks and fsmonitor are
+/// off: root must never run a program named in a repo. Its global config is `<data>/gitconfig`,
+/// without `safe.directory`: app repos are root's (`secure_layout`), so git's ownership check
+/// stays on (a local source repo must be root's too). Known hosts: data dir.
 ///
 /// During a key rotation (Settings › Generate new key) both keys are offered, the current one
 /// first: it is still on every repo, and GitHub stops at the first key that authenticates, even
@@ -455,11 +501,14 @@ pub fn git(st: &AppState) -> Cmd {
 
 /// git with exactly these deploy keys (Settings › Check access tries the new key alone).
 pub fn git_with_keys(st: &AppState, keys: &[PathBuf]) -> Cmd {
+    const GITCONFIG: &str = "# Written by server-manager: global config of its git (root). Overwritten.\n";
     let gitconfig = st.cfg.data_dir.join("gitconfig");
-    if !gitconfig.exists() {
-        let _ = std::fs::write(&gitconfig, "[safe]\n\tdirectory = *\n");
+    // Rewritten, not only created: older versions put `[safe] directory = *` here.
+    if std::fs::read_to_string(&gitconfig).ok().as_deref() != Some(GITCONFIG) {
+        let _ = std::fs::write(&gitconfig, GITCONFIG);
     }
     let mut cmd = Cmd::new("git")
+        .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
         .env("GIT_CONFIG_GLOBAL", gitconfig.to_string_lossy())
         .env("GIT_SSH_COMMAND", ssh_command(st, keys))
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -757,14 +806,7 @@ fn detect_runtime(files: &[String], read: impl Fn(&str) -> Option<String>) -> De
 
 /// Keys in a .env.example (for "12 keys found").
 fn env_keys(text: &str) -> usize {
-    text.lines()
-        .map(|l| l.trim().trim_start_matches("export "))
-        .filter(|l| {
-            !l.starts_with('#')
-                && l.split_once('=')
-                    .is_some_and(|(k, _)| validate::env_key(k.trim()).is_ok())
-        })
-        .count()
+    super::env::pairs(text).len()
 }
 
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1225,18 +1267,14 @@ async fn create(
             }
         }
     }
-    if !env
-        .lines()
-        .any(|l| l.trim_start().trim_start_matches("export ").starts_with("PORT="))
-    {
+    if !super::env::pairs(&env).iter().any(|(k, _)| k == "PORT") {
         if !env.is_empty() && !env.ends_with('\n') {
             env.push('\n');
         }
         env.push_str(&format!("PORT={}\n", b.port));
     }
-    write_private(&shared.join(".env"), &env)?;
-    // Everything the manager (root) created belongs to the app user from here on.
-    if let Err(e) = chown_r(&user, &dir).await {
+    write_private_group(&shared.join(".env"), &env, is_root().then_some(user.gid))?;
+    if let Err(e) = secure_layout(&dir, &user).await {
         log.push(format!("warning: {e}"));
     }
 
@@ -1311,26 +1349,9 @@ async fn update(
 ) -> ApiResult<Json<Value>> {
     let mut a = load(&st, &name).await?;
     let mut changed = Vec::new();
-    if let Some(r) = b.repo.as_deref().map(str::trim).filter(|r| *r != a.repo_url) {
+    let new_repo = b.repo.as_deref().map(str::trim).filter(|r| *r != a.repo_url);
+    if let Some(r) = new_repo {
         a.repo_url = repo_url(r)?.to_owned();
-        let repo = a.dir().join("repo");
-        let o = git(&st)
-            .args([
-                "-C",
-                &repo.to_string_lossy(),
-                "remote",
-                "set-url",
-                "origin",
-                &a.repo_url,
-            ])
-            .output()
-            .await?;
-        if !o.exit.success() {
-            return Err(AppError::bad_request(format!(
-                "git remote set-url: {}",
-                o.stderr.trim()
-            )));
-        }
         changed.push("repo");
     }
     if let Some(v) = &b.branch {
@@ -1383,11 +1404,44 @@ async fn update(
         a.auto_deploy = v;
         changed.push("auto_deploy");
     }
+    let mut new_user = None;
     if let Some(u) = b.run_as.as_deref().map(str::trim).filter(|u| *u != a.run_as) {
         let user = lookup_user(u).await?;
-        chown_r(&user, &a.dir()).await.map_err(AppError::Internal)?;
-        a.run_as = user.user;
+        a.run_as = user.user.clone();
+        new_user = Some(user);
         changed.push("run_as");
+    }
+    // Everything is validated: only now touch git, files and the row.
+    if new_repo.is_some() {
+        let repo = a.dir().join("repo");
+        let o = git(&st)
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "remote",
+                "set-url",
+                "origin",
+                &a.repo_url,
+            ])
+            .output()
+            .await?;
+        if !o.exit.success() {
+            return Err(AppError::bad_request(format!(
+                "git remote set-url: {}",
+                o.stderr.trim()
+            )));
+        }
+    }
+    if let Some(user) = &new_user {
+        secure_layout(&a.dir(), user).await.map_err(AppError::Internal)?;
+        // What the old user owned (releases, shared data) goes to the new one; shared/.env stays root's.
+        for sub in ["releases", "shared"] {
+            for e in std::fs::read_dir(a.dir().join(sub)).into_iter().flatten().flatten() {
+                if sub == "releases" || e.file_name() != ".env" {
+                    chown_r(user, &e.path()).await.map_err(AppError::Internal)?;
+                }
+            }
+        }
     }
     sqlx::query(
         "UPDATE apps SET repo_url = ?, branch = ?, build_cmd = ?, before_restart_cmd = ?, start_cmd = ?, port = ?,
@@ -1588,7 +1642,28 @@ pub fn routes() -> Router<AppState> {
         .route("/apps/{name}/logs", get(process_log))
 }
 
-pub fn spawn(_st: &AppState) {}
+/// At boot: `secure_layout` for every app, so existing installs are fixed without a deploy.
+pub fn spawn(st: &AppState) {
+    let st = st.clone();
+    tokio::spawn(async move {
+        let apps: Vec<(String, String, String)> = match sqlx::query_as("SELECT name, path, run_as FROM apps")
+            .fetch_all(&st.db)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return eprintln!("[apps] secure layout: {e}"),
+        };
+        for (name, path, run_as) in apps {
+            let r = match lookup_user(&run_as).await {
+                Ok(u) => secure_layout(FsPath::new(&path), &u).await,
+                Err(_) => Err(format!("no system user {run_as}")),
+            };
+            if let Err(e) = r {
+                eprintln!("[apps] {name}: secure layout: {e}");
+            }
+        }
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -1659,6 +1734,53 @@ mod tests {
         assert_eq!(std::fs::read_to_string(cur.with_extension("pub")).unwrap(), new);
         assert!(!next.exists() && !next.with_extension("pub").exists());
         assert_eq!(key_info(&cur).await.unwrap()["publicKey"], new.trim());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[tokio::test]
+    async fn root_git_runs_no_repo_hooks_and_trusts_no_foreign_repo() {
+        let d = std::env::temp_dir().join(format!("sm-git-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let db = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        let st = AppState::new(db, crate::config::Config::test(d.clone(), d.clone()), vec![0; 32]);
+        std::fs::write(d.join("gitconfig"), "[safe]\n\tdirectory = *\n").unwrap();
+        let c = git(&st).args(["-C", "/x/repo", "fetch", "origin"]).display();
+        let at = |s: &str| c.find(s).unwrap();
+        assert!(at("-c core.hooksPath=/dev/null") < at(" fetch"), "{c}");
+        assert!(at("-c core.fsmonitor=false") < at(" fetch"), "{c}");
+        let cfg = std::fs::read_to_string(d.join("gitconfig")).unwrap();
+        assert!(!cfg.contains("safe"), "old safe.directory = * is rewritten: {cfg}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[tokio::test]
+    async fn rejected_update_leaves_the_git_remote_alone() {
+        let d = std::env::temp_dir().join(format!("sm-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let o = Cmd::new("sh")
+            .args(["-c", "git init -q --bare repo && git -C repo remote add origin https://old.example/x.git"])
+            .cwd(&d)
+            .output()
+            .await
+            .unwrap();
+        assert!(o.exit.success(), "{}", o.stderr);
+        let db = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&db).await.unwrap();
+        let st = AppState::new(db, crate::config::Config::test(d.clone(), d.clone()), vec![0; 32]);
+        sqlx::query("INSERT INTO apps (name, repo_url, branch, path, start_cmd, port, keep_releases) VALUES ('demo', 'https://old.example/x.git', 'main', ?, 'true', 3999, 2)")
+            .bind(d.to_string_lossy())
+            .execute(&st.db)
+            .await
+            .unwrap();
+        let body: UpdateBody =
+            serde_json::from_value(json!({ "repo": "https://new.example/x.git", "keepReleases": 99 })).unwrap();
+        let admin = Admin { id: 1, username: "t".into() };
+        let r = update(State(st.clone()), Extension(admin), Path("demo".into()), Json(body)).await;
+        assert!(r.is_err());
+        let o = Cmd::new("git").args(["-C", "repo", "remote", "get-url", "origin"]).cwd(&d).output().await.unwrap();
+        assert_eq!(o.stdout.trim(), "https://old.example/x.git");
         std::fs::remove_dir_all(&d).ok();
     }
 

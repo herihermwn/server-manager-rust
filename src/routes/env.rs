@@ -8,7 +8,7 @@
 
 use crate::{
     activity,
-    auth::Admin,
+    auth::{Admin, write_private_group},
     exec::Cmd,
     http::{ApiResult, AppError},
     state::AppState,
@@ -22,8 +22,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
     path::{Path as FsPath, PathBuf},
     time::Duration,
 };
@@ -157,6 +155,20 @@ fn parse(text: &str) -> (EnvFile, Vec<ParseError>) {
         i += 1;
     }
     (EnvFile { lines: out }, errs)
+}
+
+/// KEY=value pairs in file order (duplicates kept, so applying them in order = last wins), for
+/// readers outside this module: same parser as the editor, systemd sees the same values.
+pub(crate) fn pairs(text: &str) -> Vec<(String, String)> {
+    parse(text)
+        .0
+        .lines
+        .into_iter()
+        .filter_map(|l| match l {
+            Line::Var { key, value, .. } => Some((key, value)),
+            Line::Raw(_) => None,
+        })
+        .collect()
 }
 
 /// Read a double-quoted value up to the closing quote; true when the quote closed on this line.
@@ -477,40 +489,34 @@ fn paste_errors(file: &EnvFile, incoming: &EnvFile, mut errs: Vec<ParseError>) -
 
 // ---------- files ----------
 
-/// Temp file in the same folder (mode 600 from the first byte), fsync, rename over the target.
-fn write_atomic(path: &FsPath, text: &str) -> std::io::Result<()> {
-    let dir = path.parent().ok_or_else(|| std::io::Error::other("no parent folder"))?;
-    std::fs::create_dir_all(dir)?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let tmp = dir.join(format!(".env.{}.{nanos}.tmp", std::process::id()));
-    let r = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if r.is_err() {
-        std::fs::remove_file(&tmp).ok();
-    }
-    r
-}
-
 struct Loaded {
     file: EnvFile,
     mtime: Option<i64>,
     rev: String,
 }
 
+/// Read a .env without following a symlink at its name (O_NOFOLLOW; O_NONBLOCK so a FIFO can't
+/// hang us); it must be a regular file. Both are InvalidInput errors. Also used by deploys.
+pub(crate) fn read_env_file(path: &FsPath) -> std::io::Result<(String, std::fs::Metadata)> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let bad = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} {what}.", path.display()));
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| if e.raw_os_error() == Some(libc::ELOOP) { bad("is a symlink, not a file") } else { e })?;
+    let m = f.metadata()?;
+    if !m.is_file() {
+        return Err(bad("is not a regular file"));
+    }
+    let mut text = String::new();
+    f.read_to_string(&mut text)?;
+    Ok((text, m))
+}
+
 fn load(path: &FsPath) -> ApiResult<Loaded> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let m = std::fs::metadata(path)?;
+    match read_env_file(path) {
+        Ok((text, m)) => {
             let t = m
                 .modified()
                 .ok()
@@ -526,6 +532,7 @@ fn load(path: &FsPath) -> ApiResult<Loaded> {
             mtime: None,
             rev: "none".into(),
         }),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(AppError::bad_request(e.to_string())),
         Err(e) => Err(e.into()),
     }
 }
@@ -536,14 +543,22 @@ struct Target {
     id: i64,
     name: String,
     path: PathBuf,
-    /// apps.run_as: owner of the .env file (the unit reads it as root, the app user may too).
+    /// apps.run_as: its group may read the .env file (the unit reads it as root).
     run_as: String,
 }
 
-/// write_atomic (mode 600), then hand the file to the app's run_as user when the manager is root.
+/// Atomic write; when the manager is root the file is root:<run_as group> 0640 (set on the temp
+/// file before the rename): the unit reads it as root, the app user may read it, not write it.
 async fn write_env(t: &Target, text: &str) -> std::io::Result<()> {
-    write_atomic(&t.path, text)?;
-    super::apps::chown_to(&t.run_as, &t.path).await
+    let gid = if super::apps::is_root() {
+        let u = super::apps::lookup_user(&t.run_as)
+            .await
+            .map_err(|_| std::io::Error::other(format!("no system user {}", t.run_as)))?;
+        Some(u.gid)
+    } else {
+        None
+    };
+    write_private_group(&t.path, text, gid)
 }
 
 async fn target(st: &AppState, name: &str) -> ApiResult<Target> {
@@ -553,10 +568,9 @@ async fn target(st: &AppState, name: &str) -> ApiResult<Target> {
         .fetch_optional(&st.db)
         .await?;
     let (id, run_as) = row.ok_or_else(|| AppError::not_found("App not found."))?;
-    let path = validate::path_under(
-        &st.cfg.apps_dir,
-        &st.cfg.apps_dir.join(name).join("shared").join(".env"),
-    )?;
+    // The literal path, not the resolved one: a symlinked .env must reach load's O_NOFOLLOW.
+    let path = st.cfg.apps_dir.join(name).join("shared").join(".env");
+    validate::path_under(&st.cfg.apps_dir, &path)?;
     Ok(Target {
         id,
         name: name.to_owned(),
@@ -1017,7 +1031,7 @@ pub fn spawn(_st: &AppState) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::{auth::write_private, config::Config};
     use std::os::unix::fs::PermissionsExt;
 
     fn kv(f: &EnvFile) -> Vec<(String, String)> {
@@ -1061,6 +1075,13 @@ mod tests {
         assert_eq!(m["ML"], "l1\nl2");
         assert_eq!(m["ESC"], "a\nb \"q\"");
         assert!(matches!(f.lines[2], Line::Var { export: true, .. }));
+    }
+
+    #[test]
+    fn pairs_use_the_real_parser() {
+        let p = pairs("# c\nexport A=\"x\\ny\"\nB='p#q'\nbad line\nC=1 # note\nA=2\n");
+        let want = [("A", "x\ny"), ("B", "p#q"), ("C", "1"), ("A", "2")];
+        assert_eq!(p, want.map(|(k, v)| (k.to_owned(), v.to_owned())));
     }
 
     #[test]
@@ -1258,18 +1279,31 @@ mod tests {
     fn atomic_write_is_mode_600_and_leaves_no_temp() {
         let d = tmpdir("atomic");
         let p = d.join("shared").join(".env");
-        write_atomic(&p, "A=1\n").unwrap();
+        write_private(&p, "A=1\n").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "A=1\n");
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         // an existing 644 file is replaced by a 600 one
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_atomic(&p, "A=2\n").unwrap();
+        write_private(&p, "A=2\n").unwrap();
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         let left: Vec<_> = std::fs::read_dir(p.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from(".env")]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn load_refuses_a_symlinked_env() {
+        let d = tmpdir("symlink");
+        std::fs::write(d.join("secret"), "ROOT_ONLY=1\n").unwrap();
+        std::os::unix::fs::symlink(d.join("secret"), d.join(".env")).unwrap();
+        let e = msg(load(&d.join(".env")).err().expect("symlink refused"));
+        assert!(e.contains("symlink"), "{e}");
+        std::fs::create_dir(d.join("dir")).unwrap();
+        assert!(load(&d.join("dir")).is_err(), "a folder is not a .env");
+        assert_eq!(load(&d.join("missing")).ok().map(|l| l.rev), Some("none".into()));
         std::fs::remove_dir_all(&d).ok();
     }
 

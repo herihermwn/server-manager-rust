@@ -135,28 +135,18 @@ fn conflict(msg: impl Into<String>) -> AppError {
 
 // ---------- .env helpers ----------
 
-/// KEY=value pairs of shared/.env (comments, `export`, matching quotes handled). Used as the
-/// build environment. ponytail: simple parser, no multi-line values; phase 4 owns the real one.
+/// KEY=value pairs of shared/.env, read with the editor's parser (env.rs), so the build sees the
+/// same values as the app. Used as the build environment.
 fn dotenv(app: &AppRow) -> Vec<(String, String)> {
-    let text = std::fs::read_to_string(app.env_path()).unwrap_or_default();
-    text.lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            let l = l.strip_prefix("export ").unwrap_or(l);
-            if l.starts_with('#') {
-                return None;
+    match super::env::read_env_file(&app.env_path()) {
+        Ok((text, _)) => super::env::pairs(&text),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("[deploys] {}: .env not read: {e}", app.name);
             }
-            let (k, v) = l.split_once('=')?;
-            let v = v.trim();
-            let v = v
-                .strip_prefix('"')
-                .and_then(|x| x.strip_suffix('"'))
-                .or_else(|| v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
-                .unwrap_or(v);
-            Some((k.trim().to_owned(), v.to_owned()))
-        })
-        .filter(|(k, _)| crate::validate::env_key(k).is_ok())
-        .collect()
+            Vec::new()
+        }
+    }
 }
 
 /// Values to mask in deploy/process logs: every .env value of 6+ characters that is not a plain
@@ -207,12 +197,8 @@ async fn create_row(
     actor: &str,
     preface: &[String],
 ) -> ApiResult<Job> {
-    let number: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(number), 0) + 1 FROM deploys WHERE app_id = ?")
-        .bind(app.id)
-        .fetch_one(&st.db)
-        .await?;
     let (release, commit, message) = match kind {
-        Kind::Deploy => (number, None, None),
+        Kind::Deploy => (None, None, None),
         Kind::Rollback { release } => {
             let r: Option<(Option<String>, Option<String>)> = sqlx::query_as(
                 "SELECT commit_sha, commit_message FROM deploys WHERE app_id = ? AND release = ? AND status = 'success' ORDER BY id DESC LIMIT 1",
@@ -222,30 +208,38 @@ async fn create_row(
             .fetch_optional(&st.db)
             .await?;
             let (c, m) = r.unwrap_or_default();
-            (release, c, m)
+            (Some(release), c, m)
         }
     };
-    let log_path = st.cfg.logs_dir().join(&app.name).join(format!("{number}.log"));
-    let sink = LogSink::open(&log_path)?;
-    for l in preface {
-        sink.line(l);
-    }
-    let deploy_id = sqlx::query(
+    // One statement picks the number and inserts it, so two deploys started at once can't both
+    // take MAX+1 (UNIQUE(app_id, number)). A deploy's release is its number.
+    let dir = st.cfg.logs_dir().join(&app.name);
+    let (deploy_id, number, log_path): (i64, i64, String) = sqlx::query_as(
         "INSERT INTO deploys (app_id, number, release, commit_sha, commit_message, branch, trigger, status, log_path, actor)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+         SELECT ?1, n, COALESCE(?2, n), ?3, ?4, ?5, ?6, 'queued', ?7 || n || '.log', ?8
+         FROM (SELECT COALESCE(MAX(number), 0) + 1 AS n FROM deploys WHERE app_id = ?1)
+         RETURNING id, number, log_path",
     )
     .bind(app.id)
-    .bind(number)
     .bind(release)
     .bind(commit)
     .bind(message)
     .bind(&app.branch)
     .bind(trigger)
-    .bind(log_path.to_string_lossy())
+    .bind(format!("{}/", dir.to_string_lossy()))
     .bind(actor)
-    .execute(&st.db)
-    .await?
-    .last_insert_rowid();
+    .fetch_one(&st.db)
+    .await?;
+    let sink = match LogSink::open(FsPath::new(&log_path)) {
+        Ok(s) => s,
+        Err(e) => {
+            finish_row(st, deploy_id, "failed", Some(&format!("log file: {e}"))).await;
+            return Err(e.into());
+        }
+    };
+    for l in preface {
+        sink.line(l);
+    }
     Ok(Job {
         deploy_id,
         number,
@@ -333,7 +327,8 @@ async fn finish_row(st: &AppState, id: i64, status: &str, error: Option<&str>) {
 // ---------- pipeline ----------
 
 /// How the pipeline talks to the process manager. Tests swap systemd for a fake whose health
-/// check passes only when the live release contains a file named `healthy`.
+/// check passes only when the live release contains a file named `healthy`, and whose restart
+/// fails when it contains `no-restart`.
 #[derive(Clone, Copy)]
 enum Svc {
     Systemd,
@@ -348,6 +343,8 @@ impl Svc {
                 apps::install_unit(app).await?;
                 apps::restart_app(&app.name).await
             }
+            #[cfg(test)]
+            Svc::Fake if app.dir().join("current/no-restart").exists() => Err("fake: restart failed".into()),
             #[cfg(test)]
             Svc::Fake => Ok(()),
         }
@@ -424,6 +421,74 @@ fn switch(dir: &FsPath, release: i64) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(format!("releases/{release}"), &tmp)?;
     std::fs::rename(&tmp, dir.join("current"))
+}
+
+/// Each folder from `base` down to the parent of `base/name` must be a real folder, not a symlink
+/// (repo content and the app user's shared/ may hold any); missing ones are created. With `gid`
+/// (root), each becomes root:<gid> 0750 top-down, so the app user can't swap the next level.
+fn real_parents(base: &FsPath, name: &FsPath, gid: Option<u32>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut p = base.to_path_buf();
+    for c in name.parent().into_iter().flat_map(FsPath::components) {
+        p.push(c);
+        match p.symlink_metadata() {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(std::io::Error::other(format!("{} is a symlink or not a folder", p.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&p)?,
+            Err(e) => return Err(e),
+        }
+        if let Some(gid) = gid {
+            std::os::unix::fs::lchown(&p, Some(0), Some(gid))?;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o750))?;
+        }
+    }
+    Ok(())
+}
+
+/// Link shared/<p> into the release `rel` (still root's) without following a symlink, in the repo
+/// content or in shared/. `owner` (root only): a leaf created now goes to the app user, shared/.env
+/// stays root:<gid> 0640. Ok(true) = a non-.env leaf seeded from the repo (first deploy).
+fn link_shared(dir: &FsPath, rel: &FsPath, p: &str, owner: Option<&exec::RunAs>) -> std::io::Result<bool> {
+    use std::os::unix::fs::{PermissionsExt, lchown};
+    let name = FsPath::new(p.trim_end_matches('/'));
+    let shared = dir.join("shared");
+    let (src, dst) = (shared.join(name), rel.join(name));
+    real_parents(rel, name, None)?;
+    real_parents(&shared, name, owner.map(|u| u.gid))?;
+    let real = |p: &FsPath| p.symlink_metadata().map(|m| !m.file_type().is_symlink());
+    let (mut seeded, mut created) = (false, false);
+    match real(&src) {
+        Ok(true) => {}
+        Ok(false) => return Err(std::io::Error::other(format!("shared/{} is a symlink", name.display()))),
+        Err(_) if real(&dst).unwrap_or(false) => {
+            std::fs::rename(&dst, &src)?; // first deploy: seed shared/ from the repo
+            seeded = true;
+        }
+        Err(_) if p.ends_with('/') => {
+            std::fs::create_dir(&src)?;
+            created = true;
+        }
+        Err(_) => {
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&src)?;
+            created = true;
+        }
+    }
+    let env = name == FsPath::new(".env");
+    if let Some(u) = owner {
+        if env {
+            lchown(&src, Some(0), Some(u.gid))?;
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o640))?;
+        } else if created {
+            lchown(&src, Some(u.uid), Some(u.gid))?;
+        }
+    }
+    match std::fs::symlink_metadata(&dst) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&dst)?,
+        Ok(_) => std::fs::remove_file(&dst)?,
+        Err(_) => {}
+    }
+    std::os::unix::fs::symlink(&src, &dst)?;
+    Ok(seeded && !env)
 }
 
 fn live_release(dir: &FsPath) -> Option<i64> {
@@ -608,6 +673,11 @@ impl Ctx {
         let b = &self.app.branch;
 
         self.mark("Pull", "running", None).await;
+        // Before any git: repo/, releases/ and shared/ are root's (older installs are fixed here too).
+        if let Err(e) = apps::secure_layout(&dir, &self.user).await {
+            self.mark("Pull", "failed", None).await;
+            return Err(fail(format!("Pull: {e}")));
+        }
         let refspec = format!("+refs/heads/{b}:refs/remotes/origin/{b}");
         self.exec(
             "Pull",
@@ -652,42 +722,26 @@ impl Ctx {
             apps::git(&self.st).args(["-C", &repo, "worktree", "add", "--detach", "--force", &rel_s, &sha]),
         )
         .await?;
-        for d in [dir.join("repo"), rel.clone()] {
-            apps::chown_r(&self.user, &d)
-                .await
-                .map_err(|e| fail(format!("Pull: {e}")))?;
+        // Again: the manager's umask is 077, so new objects and worktree files need group read
+        // for git in the build. The release stays root's until shared/ is linked into it.
+        if let Err(e) = apps::secure_layout(&dir, &self.user).await {
+            self.mark("Pull", "failed", None).await;
+            return Err(fail(format!("Pull: {e}")));
         }
         self.mark("Pull", "success", Some(0)).await;
         self.check_cancel()?;
 
         self.mark("Link shared", "running", None).await;
+        let owner = apps::is_root().then_some(&self.user);
         for p in self.app.shared() {
             let name = p.trim_end_matches('/');
-            let src = dir.join("shared").join(name);
-            let dst = rel.join(name);
-            let r = (|| -> std::io::Result<()> {
-                if !src.exists() {
-                    if let Some(parent) = src.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    if dst.exists() {
-                        std::fs::rename(&dst, &src)?; // first deploy: seed shared/ from the repo
-                    } else if p.ends_with('/') {
-                        std::fs::create_dir_all(&src)?;
-                    } else {
-                        std::fs::write(&src, "")?;
-                    }
-                }
-                if let Some(parent) = dst.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                match std::fs::symlink_metadata(&dst) {
-                    Ok(m) if m.is_dir() => std::fs::remove_dir_all(&dst)?,
-                    Ok(_) => std::fs::remove_file(&dst)?,
-                    Err(_) => {}
-                }
-                std::os::unix::fs::symlink(&src, &dst)
-            })();
+            let r = match link_shared(&dir, &rel, &p, owner) {
+                // Seeded from the repo: root made those files, they are the app user's data now.
+                Ok(true) => apps::chown_r(&self.user, &dir.join("shared").join(name))
+                    .await
+                    .map_err(std::io::Error::other),
+                r => r.map(|_| ()),
+            };
             match r {
                 Ok(()) => self.log(&format!("linked {name} → shared/{name}")),
                 Err(e) => {
@@ -696,7 +750,8 @@ impl Ctx {
                 }
             }
         }
-        if let Err(e) = apps::chown_r(&self.user, &dir.join("shared")).await {
+        // Only now does the release become the app user's.
+        if let Err(e) = apps::chown_r(&self.user, &rel).await {
             self.mark("Link shared", "failed", None).await;
             return Err(fail(format!("Link shared: {e}")));
         }
@@ -759,19 +814,25 @@ impl Ctx {
                     Ok(()) => self.svc.restart(&self.app).await,
                     Err(e) => Err(e),
                 };
-                let _ = sqlx::query("UPDATE apps SET current_release = ? WHERE id = ?")
-                    .bind(p)
-                    .bind(self.app.id)
-                    .execute(&self.st.db)
-                    .await;
                 match back {
-                    Ok(()) => self.log(&format!("release #{p} is live again")),
-                    Err(e) => self.log(&format!("error: rollback restart failed: {e}")),
+                    Ok(()) => {
+                        let _ = sqlx::query("UPDATE apps SET current_release = ? WHERE id = ?")
+                            .bind(p)
+                            .bind(self.app.id)
+                            .execute(&self.st.db)
+                            .await;
+                        self.log(&format!("release #{p} is live again"));
+                        Err(Fail {
+                            status: "rolled_back",
+                            error: format!("{err} Rolled back to release #{p}."),
+                        })
+                    }
+                    // Not "rolled_back": the app may be down and `current` may still be `target`.
+                    Err(e) => {
+                        self.log(&format!("error: rollback to release #{p} failed: {e}"));
+                        Err(fail(format!("{err} Rollback to release #{p} failed too: {e}")))
+                    }
                 }
-                Err(Fail {
-                    status: "rolled_back",
-                    error: format!("{err} Rolled back to release #{p}."),
-                })
             }
             None => Err(fail(err)),
         }
@@ -1372,6 +1433,41 @@ mod tests {
         assert!(!verify_signature(b"s3cret", body, ""));
     }
 
+    #[test]
+    fn link_shared_follows_no_symlink() {
+        let tmp = std::env::temp_dir().join(format!("sm-link-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (dir, outside) = (tmp.join("app"), tmp.join("outside"));
+        let rel = dir.join("releases/1");
+        for d in [&rel, &dir.join("shared"), &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let untouched = |what: &str| {
+            let left: Vec<_> = std::fs::read_dir(&outside).unwrap().collect();
+            assert!(left.is_empty(), "{what}: {left:?}");
+        };
+        // (a) the repo commits storage -> <outside>; shared path storage/uploads.
+        std::os::unix::fs::symlink(&outside, rel.join("storage")).unwrap();
+        let e = link_shared(&dir, &rel, "storage/uploads/", None).unwrap_err();
+        assert!(e.to_string().contains("symlink"), "{e}");
+        untouched("repo symlink");
+        assert!(!dir.join("shared/storage").exists(), "nothing created in shared/ either");
+        // (b) the app user left a dangling shared/nologin -> <outside>/nologin.
+        std::os::unix::fs::symlink(outside.join("nologin"), dir.join("shared/nologin")).unwrap();
+        let e = link_shared(&dir, &rel, "nologin", None).unwrap_err();
+        assert!(e.to_string().contains("symlink"), "{e}");
+        untouched("dangling shared link");
+        assert!(rel.join("storage").is_symlink(), "the release is left as it was");
+        // A plain nested path still works: folders made, leaf linked.
+        assert!(!link_shared(&dir, &rel, "data/uploads/", None).unwrap());
+        assert!(dir.join("shared/data/uploads").is_dir());
+        assert_eq!(
+            std::fs::read_link(rel.join("data/uploads")).unwrap(),
+            dir.join("shared/data/uploads")
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     async fn sh(dir: &FsPath, script: &str) {
         let o = Cmd::new("sh").args(["-c", script]).cwd(dir).output().await.unwrap();
         assert!(o.exit.success(), "{script}: {}", o.stderr);
@@ -1523,6 +1619,31 @@ mod tests {
         let (_, (s, _)) = run(Kind::Rollback { release: 5 }).await;
         assert_eq!(s, "success");
         assert_eq!(live_release(&app_dir), Some(5));
+
+        // #8 restart fails and so does restarting #5 → failed (not rolled_back), no current_release write.
+        std::fs::write(app_dir.join("releases/5/no-restart"), "").unwrap();
+        sqlx::query("UPDATE apps SET current_release = NULL").execute(&st.db).await.unwrap();
+        set_build(&st, "touch no-restart").await;
+        let (_, (s, e)) = run(Kind::Deploy).await;
+        assert_eq!(s, "failed");
+        assert!(e.as_deref().unwrap_or("").contains("Rollback to release #5 failed too"), "{e:?}");
+        let cur: Option<i64> = sqlx::query_scalar("SELECT current_release FROM apps")
+            .fetch_one(&st.db)
+            .await
+            .unwrap();
+        assert_eq!(cur, None);
+
+        // Deploys started at once get distinct numbers (one INSERT picks MAX+1).
+        let app = apps::load(&st, "demo").await.unwrap();
+        let (pa, pb) = (["a".to_owned()], ["b".to_owned()]);
+        let (a, b) = tokio::join!(
+            create_row(&st, &app, Kind::Deploy, "manual", "test", &pa),
+            create_row(&st, &app, Kind::Deploy, "manual", "test", &pb),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!((a.number.min(b.number), a.number.max(b.number)), (9, 10));
+        let log9 = std::fs::read_to_string(data.join("logs/demo/9.log")).unwrap();
+        assert!(log9 == "a\n" || log9 == "b\n", "{log9}");
         let _ = (id1, id5);
         std::fs::remove_dir_all(&tmp).ok();
     }
